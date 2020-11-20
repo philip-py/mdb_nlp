@@ -122,7 +122,6 @@ class ContentAnalysis:
 
         def is_pos_getter(token):
             if token._.lemma in self.positiv:
-                # print(token.text)
                 return True
 
             elif token._.lemma in self.negativ:
@@ -190,7 +189,6 @@ class ContentAnalysis:
                     check.append(node)
                     node = seen.head
                     if seen == node.head:
-                        # print(check)
                         break
 
                 attr = set([child._.lemma.lower() for child in check if child._.is_neg])
@@ -207,10 +205,8 @@ class ContentAnalysis:
         def is_volk(token):
 
             # if token.pos_ == 'NOUN' or token.pos_ == 'PROPN':
-            # print(token._.lemma)
 
             check = list(token.children)
-            # print(check)
 
             if token._.lemma.lower() in self.people:
                 info_token = (token._.lemma, None)
@@ -303,8 +299,6 @@ class ContentAnalysis:
 
                 # Token.set_extension('is_pos_volk', getter=is_pos_volk_getter_func, force=True)
 
-                # print(token.text, token.lemma_, token._.lemma, token.pos_)
-                # print(list(token.children))
 
         matcher = Matcher(self.nlp.vocab)
         pattern = [{"_": {"is_neg_elite": True}}]
@@ -431,92 +425,94 @@ class EndOfTraining(Exception):
     pass
 
 
+def populism_score_main(df, dictionary, idf_weight):
+    df['scores'] = df.apply(lambda row: compute_score_per_category(row, dictionary, idf_weight), axis=1)
+
+    # seperate into columns:
+    df['score'] = df.apply(lambda row: sum(row.scores), axis=1)
+    df['score_volk'] = df.apply(lambda row: row.scores[0], axis=1)
+    df['score_elite'] = df.apply(lambda row: row.scores[1], axis=1)
+    df['score_attr'] = df.apply(lambda row: row.scores[2], axis=1)
+
+    return df
+
+
+def compute_score_from_counts(counts, doclen, dictionary, idf_weight):
+    # number docs should be constant!
+    scores = []
+    for term, n in counts.items():
+        score = compute_idf(term, dictionary)
+        scores.append((score**idf_weight) * n)
+    res = sum(scores) / log(doclen+10, 10)
+    # res = sum(scores)
+    return res
+
+
+def compute_score_per_term(term, doclen, dictionary, idf_weight):
+    score = compute_idf(term, dictionary) ** idf_weight
+    res = score / log(doclen+10, 10)
+    return res
+
+
+def compute_score_per_category(row, dictionary, idf_weight):
+    if row['pop'] == True:
+        volk = compute_score_from_counts(row.volk_counter, row.len, dictionary, idf_weight)
+        elite = compute_score_from_counts(row.elite_counter, row.len, dictionary, idf_weight)
+        attr = compute_score_from_counts(row.attr_counter, row.len, dictionary, idf_weight)
+    else:
+        volk = 0.0
+        elite = 0.0
+        attr = 0.0
+    return (volk, elite, attr)
+
+
+def compute_idf(term, dictionary, idf_weight=None):
+    df = dictionary.dfs[dictionary.token2id[term.lower()]]
+    if idf_weight:
+        return tfidfmodel.df2idf(df, dictionary.num_docs, log_base=2.0, add=1.0)**idf_weight
+    else:
+        score = tfidfmodel.df2idf(df, dictionary.num_docs, log_base=2.0, add=1.0)
+        return score
+
+
 def load_results_content_analysis(folder):
     """load dataframe from results folder"""
     all_files = glob.glob(f"{folder}/*.csv")
     li = []
-
     for filename in all_files:
         df = pd.read_csv(filename, index_col=None, header=0)
         df.drop(columns = 'Unnamed: 0', inplace=True)
         li.append(df)
-
     dfog = pd.concat(li, axis=0, ignore_index=True)
     # dfog = pd.read_csv(filename)
     dfval = pd.read_json("data/plenar_meta.json", orient="index")
+    # keep for future
     # dfval_2 = pd.read_json('/media/philippy/SSD/data/ma/corpus/presse_meta.json', orient='index')
     # dfval_3 = pd.read_json('/media/philippy/SSD/data/ma/corpus/twitter_meta.json', orient='index')
     # dfval = dfval_1.append([dfval_2, dfval_3])
-
     dfval["doc"] = dfval.index
     dfval["doc"] = dfval.doc.apply(lambda x: x.split(".")[0])
-
     # fix timestamps
     df = dfval.copy()
-
     df["date"] = df.datum
     df["date"] = pd.to_datetime(df["date"], unit="ms", errors="ignore")
-    # df['presse_datum_clean'] = pd.to_datetime(df['presse_datum_clean'])
-    # df['timestamp'] = pd.to_datetime(df['timestamp'])
-    # df['date'].fillna(df.presse_datum_clean, inplace=True)
-    # df['date'].fillna(df.timestamp, inplace=True)
-
     dfval = df
-
-    dfs = dfog.merge(dfval.loc[:, ["date", "party", "doc"]], how="left", on="doc")
-
+    # merge results and meta
+    dfs = dfog.merge(dfval.loc[:, ["date", "party", "doc", "name_res", "gender", "election_list", "education", "birth_year"]], how="left", on="doc")
     dfs = dfs.set_index("date").loc["2013-10-01":"2020-01-01"]
     dfs["date"] = dfs.index
-
+    # eval strings
     dfs["elite_attr"] = dfs.apply(lambda row: eval(str(row.elite_attr)), axis=1)
     dfs["volk_counter"] = dfs.apply(lambda row: eval(str(row.volk_counter)), axis=1)
     dfs["elite_counter"] = dfs.apply(lambda row: eval(str(row.elite_counter)), axis=1)
     dfs['attr_counter'] = dfs.apply(lambda row: Counter([term for i in row.elite_attr for term in (i[1] if i[1] is not None else [])]), axis=1)
     dfs["hits_pop"] = dfs.apply(lambda row: eval(str(row.hits_pop)), axis=1)
-
+    # add type and opposition
     dfs["typ"] = dfs["doc"].apply(lambda row: row.split("_")[0])
     dfs["opp"] = dfs.apply(lambda row: isopp(row), axis=1)
-
     return dfs
 
 
-def compute_score_from_counts(counts, doclen, dictionary, number_docs):
-    scores = []
-    for term in counts:
-        df = dictionary.dfs[dictionary.token2id[term.lower()]]
-        score = tfidfmodel.df2idf(df, number_docs, log_base=2.0, add=1.0)
-        scores.append(score)
-    res = sum(scores) / log(doclen + 3, 10)
-    return res
-
-
-def compute_idf(term, dictionary, number_docs):
-    df = dictionary.dfs[dictionary.token2id[term.lower()]]
-    score = tfidfmodel.df2idf(df, number_docs, log_base=2.0, add=0.0)
-    return score
-
-
-def compute_pop_score(all_hits, doclen, dictionary, number_docs):
-    res = dict()
-    scores_volk = []
-    scores_elite = []
-    for hit in all_hits:
-        for volk in hit[0]:
-            term = volk[0]
-            idf = compute_idf(term, dictionary, number_docs)
-            score = idf / log(doclen + 3, 10)
-            scores_volk.append(score)
-
-        for elite in hit[1]:
-            term = elite[0]
-            idf = compute_idf(term, dictionary, number_docs)
-            score = idf / log(doclen + 3, 10)
-            scores_elite.append(score)
-
-    res["volk"] = sum(scores_volk)
-    res["elite"] = sum(scores_elite)
-
-    return res
 
 
 def isopp(row):
@@ -525,14 +521,6 @@ def isopp(row):
     else:
         return "opp"
 
-
-def compute_score_sum(d):
-    return d["volk"] + d["elite"]
-
-
-# def load_meta():
-#     df = pd.read_json("data/plenar_meta.json", orient="index")
-#     return df
 
 def merge_meta(df):
     dfval = pd.read_json("data/plenar_meta.json", orient="index")
@@ -549,6 +537,7 @@ def merge_meta(df):
     dfs = df.merge(dfval, how="left", on="doc")
 
     return dfs
+
 
 def load_data(party):
     with open("data/doc_labels_plenar.pkl", "rb") as f:
@@ -682,6 +671,15 @@ def print_doc(label):
     meta = load_meta()
     print(meta.loc[f'{label}.txt'])
     print(gendocs(label))
+
+
+# def compute_score_sum(d):
+    # return d["volk"] + d["elite"]
+
+
+# def load_meta():
+#     df = pd.read_json("data/plenar_meta.json", orient="index")
+#     return df
 
 if __name__ == "__main__":
     # %%

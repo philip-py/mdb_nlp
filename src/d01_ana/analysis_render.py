@@ -124,7 +124,6 @@ class ContentAnalysisRender:
 
         def is_pos_getter(token):
             if token._.lemma in self.positiv:
-                # print(token.text)
                 return True
 
             elif token._.lemma in self.negativ:
@@ -193,12 +192,10 @@ class ContentAnalysisRender:
                     check.append(node)
                     node = seen.head
                     if seen == node.head:
-                        # print(check)
                         break
 
                 # experimental for viz
                 attr_token = set([child for child in check if child._.is_neg])
-                # print(attr_token)
                 for child in attr_token:
                     viz.append(get_viz(child, 'E'))
                 del attr_token
@@ -218,10 +215,8 @@ class ContentAnalysisRender:
         def is_volk(token):
 
             # if token.pos_ == 'NOUN' or token.pos_ == 'PROPN':
-            # print(token._.lemma)
 
             check = list(token.children)
-            # print(check)
 
             if token._.lemma.lower() in self.people:
                 info_token = (token._.lemma, None)
@@ -341,7 +336,6 @@ class ContentAnalysisRender:
                     "is_neg_elite", getter=is_neg_elite_getter, force=True
                 )
 
-                # print(token._.lemma)
 
                 # viz = [{"start": 4, "end": 10, "label": f"ORG | {0.0}"}]
                 if token._.is_volk:
@@ -363,8 +357,6 @@ class ContentAnalysisRender:
                     # viz.append({'start': start, 'end': end, 'label': 'E | 1.0'})
                 # Token.set_extension('is_pos_volk', getter=is_pos_volk_getter_func, force=True)
 
-                # print(token.text, token.lemma_, token._.lemma, token.pos_)
-                # print(list(token.children))
 
         matcher = Matcher(self.nlp.vocab)
         pattern = [{"_": {"is_neg_elite": True}}]
@@ -372,11 +364,11 @@ class ContentAnalysisRender:
         matches = matcher(doc)
         has_pop = set()
         has_pop_ = set()
-        # tokens_pop = []
         info = []
+        ps_counter = 1
+        last_start = None
         for j, (match_id, start, end) in enumerate(matches):
             span = doc[start - window_size : end + window_size]
-
             for token in span:
                 if token._.is_volk:
 
@@ -390,12 +382,15 @@ class ContentAnalysisRender:
                     sentence_end = span[-1].sent.end
                     has_pop.add(doc[sentence_start:sentence_end].text)
                     has_pop_.add(doc[sentence_start:sentence_end])
-                    # print(type(doc[sentence_start]))
-                    viz.append(get_viz_start(doc[sentence_start], f'PS | {j}'))
+                    ps = get_viz_start(doc[sentence_start], f'PS | {ps_counter}')
+                    if ps not in viz:
+                        if last_start != sentence_start:
+                            ps_counter += 1
+                            viz.append(ps)
+                            last_start = sentence_start
                     # viz.append(get_viz_end(doc[sentence_end], 'PE({j})'))
                     # viz.append({'start': sentence_start, 'end': sentence_start+20, 'label': f'P'})
                     # viz.append({'start': sentence_end-10, 'end': sentence_end+1, 'label': f'P | end'})
-
 
         for i, sent in enumerate(has_pop_):
             info.append([[], []])

@@ -1,4 +1,6 @@
 feature,type
+lobby,elite_eco
+lobbyismus,elite_eco
 klientelpolitik,elite_noneg
 abgeordneter,elite_pol
 arbeitsminister,elite_pol
