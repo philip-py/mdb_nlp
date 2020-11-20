@@ -1,4 +1,5 @@
 feature,type
+klientelpolitik,elite_noneg
 abgeordneter,elite_pol
 arbeitsminister,elite_pol
 außenminister,elite_pol
@@ -132,6 +133,7 @@ parlamentarier,elite_pol
 politik,elite_pol
 politiker,elite_pol
 politelite,elite_pol
+politisch,elite_pol
 rechtsstaat,elite_pol
 rechtssystem,elite_pol
 regierung,elite_pol
@@ -299,12 +301,13 @@ linksgrün,elite_noneg
 lüge,elite_noneg
 lügenpresse,elite_noneg
 lügenmärchen,elite_noneg
-lügengeschichtemainstream,elite_noneg
+lügengeschichtenmainstream,elite_noneg
 meinungsdiktatur,elite_noneg
 migrationskrise,elite_noneg
 parasiten,elite_noneg
 propaganda,elite_noneg
 propagandisten,elite_noneg
+schwindel,elite_noneg
 sprachfaschismus,elite_noneg
 skandal,elite_noneg
 staatsfunk,elite_noneg

@@ -2,10 +2,14 @@
 import os
 from src.d01_ana.analysis import *
 from src.d00_utils.helper import chunks, flatten
+from src.d01_ana.analysis_render import ContentAnalysisRender
+from spacy import displacy
+import re
+import spacy
 
 def compute_populism_score(dfs, dictionary):
 
-    number_documents = len(dfs)
+    number_documents = 29500
 
     dfs['score_pop'] = dfs.apply(lambda row: compute_pop_score(row.hits_pop, row['len'], dictionary, number_documents), axis=1)
 
@@ -43,7 +47,7 @@ def content_analysis(directory, party='all', sample=None):
         # print(f'Content Analysis on batch:{i+1}')
         res = []
         for label in tqdm(batch):
-            res.append(c.analyze(label, gendocs(label)))
+            res.append(c.analyze(label, gendocs(label), window_size=60))
         df = pd.DataFrame(res)
         df.to_csv(f'res_ca/{directory}/res_ca_{party}_{i}.csv')
 
@@ -75,7 +79,7 @@ def discourse_analysis(directory, party=None, iter=1, sample=None, **kwargs):
     model.build_vocab(sentences)
 
     # intersect
-    pre = KeyedVectors.load('wiki.model')
+    pre = KeyedVectors.load('embeddings/wiki.model')
     res = intersect(pre, model)
     del pre
 
@@ -102,18 +106,69 @@ def discourse_analysis(directory, party=None, iter=1, sample=None, **kwargs):
     print(f'Discourse Analysis complete. \nResults saved in {directory}/...')
 
 
+def viz(label):
+
+    c = ContentAnalysisRender('de_core_news_lg', 'dict', None, render=True)
+
+    text = gendocs(label)
+
+    res = c.analyze(label, text)
+
+    # print(res)
+
+    df = pd.DataFrame([res])
+    dfs = merge_meta(df)
+    print(dfs.party[0])
+    print(dfs.columns)
+
+    ex = [{
+    'text': text,
+    'ents': res['viz'],
+    'title': f"ID: {res['doc']} | {dfs.name_res[0]} ({dfs['party'][0]}) | {dfs['date'][0].strftime('%d/%m/%Y')}"
+    }]
+
+    all_ents = {i['label'] for i in res['viz']}
+    print(all_ents)
+
+    # elite = re.compile('E.*')
+    # volk = re.compile('V.*')
+
+    options = {'ents': all_ents, 'colors': dict()}
+
+
+    for ent in all_ents:
+        if ent.startswith('E'):
+            options['colors'][ent] = 'coral'
+        if ent.startswith('V'):
+            options['colors'][ent] = 'lightgrey'
+        if ent.startswith('P'):
+            options['colors'][ent] = 'yellow'
+
+    displacy.render(ex, style='ent', manual=True, jupyter=True, options=options)
+
+
+doc_labels = load_data('AfD')[666]
+viz(doc_labels)
+
 # %%
 if __name__ == "__main__":
     pass
 
 # %%
+
+
+# %%
 %env PYTHONHASHSEED=0
 
 # %%
-discourse_analysis('afd_min2', party='AfD', iter=2, sample=None, min_count=2)
+# discourse_analysis('afd_min2', party='AfD', iter=2, sample=None, min_count=2)
 
 # %%
 # content_analysis('plenar_all', party='AfD', sample=100)
+
+# %%
+# doc_labels = load_data('AfD')[666]
+# viz(doc_labels)
 
 # %%
 print_doc('plenar_004996')
@@ -122,18 +177,42 @@ print_doc('plenar_004996')
 df = load_results_content_analysis('res_ca/results_ca')
 
 # %%
-def compute_from_counts(counts, doclen, dictionary, number_docs, idf_weight):
+
+
+
+
+# %%
+# actually used functions for pop_score!!!
+def populism_score_main(df, dictionary, idf_weight):
+    df['scores'] = df.apply(lambda row: compute_per_category(row, dictionary, dictionary.num_docs, idf_weight), axis=1)
+
+    # seperate into columns:
+    df['score'] = df.apply(lambda row: sum(row.scores), axis=1)
+    df['score_volk'] = df.apply(lambda row: row.scores[0], axis=1)
+    df['score_elite'] = df.apply(lambda row: row.scores[1], axis=1)
+    df['score_attr'] = df.apply(lambda row: row.scores[2], axis=1)
+
+    return df
+
+def compute_from_counts(counts, doclen, dictionary, idf_weight):
+    # number docs should be constant!
     scores = []
     for term, n in counts.items():
-        score = compute_idf(term, dictionary, number_docs)
-        scores.append(score*n)
+        score = compute_idf(term, dictionary, dictionary.num_docs)
+        scores.append((score**idf_weight) * n)
         # print(term, n, score)
-    # res = sum(scores) / log(doclen+10, 10)
-    res = sum(scores)
+    res = sum(scores) / log(doclen+10, 10)
+    # res = sum(scores)
     return res
 
 
-def compute(row, dictionary, number_documents, idf_weight):
+def compute_per_term(term, doclen, dictionary, idf_weight):
+    score = compute_idf(term, dictionary, dictionary.num_docs) ** idf_weight
+    res = score / log(doclen+10, 10)
+    return res
+
+
+def compute_per_category(row, dictionary, number_documents, idf_weight):
     if row['pop'] == True:
         volk = compute_from_counts(row.volk_counter, row.len, dictionary, number_documents, idf_weight)
         elite = compute_from_counts(row.elite_counter, row.len, dictionary, number_documents, idf_weight)
@@ -144,41 +223,50 @@ def compute(row, dictionary, number_documents, idf_weight):
         attr = 0.0
     return (volk, elite, attr)
 
-def scoring(df, dictionary, idf_weight):
-    number_documents = len(df)
-    df['scores'] = df.apply(lambda row: compute(row, dictionary, number_documents, idf_weight), axis=1)
+# %%
+df = scoring(df, dictionary, 2)
+df.groupby('party').mean()
 
-    # seperate into columns:
-    df['score'] = df.apply(lambda row: sum(row.scores), axis=1)
-    df['score_volk'] = df.apply(lambda row: row.scores[0], axis=1)
-    df['score_elite'] = df.apply(lambda row: row.scores[1], axis=1)
-    df['score_attr'] = df.apply(lambda row: row.scores[2], axis=1)
-
-
-
-    return df
 
 # %%
-dictionary = pickle.load(open('plenar_dict.pkl', 'rb'))
-df = scoring(df, dictionary, 10000)
-df.groupby('party').mean()
+# EVALUATE!!!
+df.sort_values('score', ascending=False)[['party', 'doc']][:500]
+
 
 # %%
 import statsmodels.api as sm
 df_reg = df.copy()
+# change daterange?
+df_reg = df_reg.loc["2018-01-01":"2020-01-01"]
 # df_reg = df_reg.loc[df['pop'] == True]
 reg = df_reg[['typ', 'opp', 'date', 'score', 'party']].dropna()
 
-reg['date'] = reg['date'].dt.strftime('%y')
-reg['date'] = reg.date.astype('int')
-reg['date'] = reg['date'] - 13
+def sommerpause(row):
+    if 7 < row.month < 9:
+        return "sommerpause"
+    else:
+        return "keine_sommerpause"
+
+reg['year'] = reg['date'].dt.strftime('%y')
+reg['year'] = reg['year'].astype('int')
+reg['year'] = reg['year'] - 13
+reg['month'] = reg['date'].dt.strftime('%m')
+reg['month'] = reg['month'].astype('int')
+reg['is_summer'] = reg.apply(lambda row: sommerpause(row), axis=1)
 
 sm.add_constant(reg)
 
-res = sm.Poisson.from_formula("score ~ C(party, Treatment('CDU')) + date", reg, missing='drop').fit()
+res = sm.Poisson.from_formula("score ~ C(party, Treatment('CDU')) + year", reg, missing='drop').fit()
+# res = sm.OLS.from_formula("score ~ C(opp, Treatment('not_opp'))", reg, missing='drop').fit()
 # res = sm.Poisson.from_formula("score ~ C(party, Treatment('CDU')) + date * C(party, Treatment('CDU'))", reg, missing='drop').fit()
 
-res.summary()
+sum = res.summary()
+
+# %%
+df.sort_values('score', ascending=False)[['party', 'doc']][:500]
+
+# %%
+
 
 # %%
 import plotly.express as px
@@ -226,6 +314,12 @@ How to improve?
 - create a very small evaluation set!
 """
 
+# %%
+models = load_models('ALL', 3)
+model = merge_embeddings(models)
+
+# %%
+model.wv.most_similar('migration')
 
 # %%
 def compute_res(df, dictionary):
