@@ -26,6 +26,7 @@ from gensim import utils
 from gensim.models import KeyedVectors
 from gensim.test.utils import datapath, get_tmpfile
 from gensim.models import tfidfmodel
+from src.d00_utils.helper import flatten
 
 # %%
 class ContentAnalysis:
@@ -168,19 +169,19 @@ class ContentAnalysis:
                         for tok in t.children:
                             if tok.dep_ == "pd":
                                 check.append(tok)
-                            if tok.dep_ == "mo":
+                            elif tok.dep_ == "mo":
                                 check.append(tok)
-                            if tok.dep_ == "oa":
+                            elif tok.dep_ == "oa":
                                 check.append(tok)
-                            if tok.dep_ == "oa2":
+                            elif tok.dep_ == "oa2":
                                 check.append(tok)
-                            if tok.dep_ == "og":
+                            elif tok.dep_ == "og":
                                 check.append(tok)
-                            if tok.dep_ == "da":
+                            elif tok.dep_ == "da":
                                 check.append(tok)
-                            if tok.dep_ == "op":
+                            elif tok.dep_ == "op":
                                 check.append(tok)
-                            if tok.dep_ == "cc":
+                            elif tok.dep_ == "cc":
                                 check.append(tok)
                             # elif tok.dep_ == 'oprd':
                             #     check.append(tok)
@@ -258,7 +259,7 @@ class ContentAnalysis:
         }
         # doc = nlp(gendocs(label))
         doc = self.nlp(text)
-        hits = {"volk": [], "volk_text": [], "elite": [], "elite_text": [], "attr": []}
+        hits = {"volk": [], "volk_text": [], "elite": [], "elite_text": [], "attr": [], "volk_ps": [], "elite_ps": [], "attr_ps": []}
 
         for i, sent in enumerate(doc.sents):
             for j, token in enumerate(sent):
@@ -270,6 +271,7 @@ class ContentAnalysis:
                 )
 
                 Token.set_extension("info", default=None, force=True)
+                Token.set_extension("attr", default=False, force=True)
                 Token.set_extension("lemma", getter=lemma_getter, force=True)
                 # Token.set_extension('is_negation', getter=is_negation_getter, force=True)
                 Token.set_extension("is_neg", getter=is_neg_getter, force=True)
@@ -333,9 +335,9 @@ class ContentAnalysis:
                 if token._.is_neg_elite:
                     info[i][1].append(token._.info)
 
+
         c_volk = Counter(([token._.is_volk for token in doc]))
         c_neg_elite = Counter(([token._.is_neg_elite for token in doc]))
-        # tokens_pop_counter = Counter(tokens_pop)
 
         if has_pop:
             res_dict["pop"] = True
@@ -426,15 +428,46 @@ class EndOfTraining(Exception):
 
 
 def populism_score_main(df, dictionary, idf_weight):
+    df['counters_pop_hits'] = df.apply(lambda row: count_pop_hits(row), axis=1)
     df['scores'] = df.apply(lambda row: compute_score_per_category(row, dictionary, idf_weight), axis=1)
-
     # seperate into columns:
-    df['score'] = df.apply(lambda row: sum(row.scores), axis=1)
+    df['score'] = df.apply(lambda row: sum(row.scores[:3]), axis=1)
+    df['score_pop'] = df.apply(lambda row: sum(row.scores[3:]), axis=1)
     df['score_volk'] = df.apply(lambda row: row.scores[0], axis=1)
     df['score_elite'] = df.apply(lambda row: row.scores[1], axis=1)
     df['score_attr'] = df.apply(lambda row: row.scores[2], axis=1)
-
+    df['score_volk_pop'] = df.apply(lambda row: row.scores[3], axis=1)
+    df['score_elite_pop'] = df.apply(lambda row: row.scores[4], axis=1)
+    df['score_attr_pop'] = df.apply(lambda row: row.scores[5], axis=1)
     return df
+
+
+def count_pop_hits(row):
+    """
+    counts volk, elite and attributes in the codings from the sentence column (pop_hits)
+    """
+    all_hits = row.hits_pop
+    label = row.doc
+    hits_volk = []
+    hits_elite = []
+    hits_attr = []
+    for hit in all_hits:
+        v = []
+        e = []
+        a = []
+        for volk in hit[0]:
+            v.append(volk[0])
+            a.append(volk[1])
+        for elite in hit[1]:
+            e.append(elite[0])
+            a.append(elite[1])
+        hits_volk.append(v)
+        hits_elite.append(e)
+        hits_attr.append(a)
+    count_volk = Counter([ i for i in flatten(hits_volk) if i is not None])
+    count_elite = Counter([i for i in flatten(hits_elite) if i is not None])
+    count_attr = Counter([i for i in flatten(hits_attr) if i is not None])
+    return count_volk, count_elite, count_attr
 
 
 def compute_score_from_counts(counts, doclen, dictionary, idf_weight):
@@ -459,11 +492,17 @@ def compute_score_per_category(row, dictionary, idf_weight):
         volk = compute_score_from_counts(row.volk_counter, row.len, dictionary, idf_weight)
         elite = compute_score_from_counts(row.elite_counter, row.len, dictionary, idf_weight)
         attr = compute_score_from_counts(row.attr_counter, row.len, dictionary, idf_weight)
+        volk_pop = compute_score_from_counts(row.counters_pop_hits[0], row.len, dictionary, idf_weight)
+        elite_pop = compute_score_from_counts(row.counters_pop_hits[1], row.len, dictionary, idf_weight)
+        attr_pop = compute_score_from_counts(row.counters_pop_hits[2], row.len, dictionary, idf_weight)
     else:
         volk = 0.0
         elite = 0.0
         attr = 0.0
-    return (volk, elite, attr)
+        volk_pop = 0.0
+        elite_pop = 0.0
+        attr_pop = 0.0
+    return (volk, elite, attr, volk_pop, elite_pop, attr_pop)
 
 
 def compute_idf(term, dictionary, idf_weight=None):
@@ -502,14 +541,14 @@ def load_results_content_analysis(folder):
     dfs = dfs.set_index("date").loc["2013-10-01":"2020-01-01"]
     dfs["date"] = dfs.index
     # eval strings
-    dfs["elite_attr"] = dfs.apply(lambda row: eval(str(row.elite_attr)), axis=1)
-    dfs["volk_counter"] = dfs.apply(lambda row: eval(str(row.volk_counter)), axis=1)
-    dfs["elite_counter"] = dfs.apply(lambda row: eval(str(row.elite_counter)), axis=1)
-    dfs['attr_counter'] = dfs.apply(lambda row: Counter([term for i in row.elite_attr for term in (i[1] if i[1] is not None else [])]), axis=1)
-    dfs["hits_pop"] = dfs.apply(lambda row: eval(str(row.hits_pop)), axis=1)
-    # add type and opposition
-    dfs["typ"] = dfs["doc"].apply(lambda row: row.split("_")[0])
-    dfs["opp"] = dfs.apply(lambda row: isopp(row), axis=1)
+    # dfs["elite_attr"] = dfs.apply(lambda row: eval(str(row.elite_attr)), axis=1)
+    # dfs["volk_counter"] = dfs.apply(lambda row: eval(str(row.volk_counter)), axis=1)
+    # dfs["elite_counter"] = dfs.apply(lambda row: eval(str(row.elite_counter)), axis=1)
+    # dfs['attr_counter'] = dfs.apply(lambda row: Counter([term for i in row.elite_attr for term in (i[1] if i[1] is not None else [])]), axis=1)
+    # dfs["hits_pop"] = dfs.apply(lambda row: eval(str(row.hits_pop)), axis=1)
+    # # add type and opposition
+    # dfs["typ"] = dfs["doc"].apply(lambda row: row.split("_")[0])
+    # dfs["opp"] = dfs.apply(lambda row: isopp(row), axis=1)
     return dfs
 
 
@@ -629,6 +668,7 @@ def format_output(all_hits):
     res = []
     attr = []
     for hit in all_hits:
+        print(hit)
         v = []
         e = []
         a = []

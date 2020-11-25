@@ -1,4 +1,6 @@
 feature,type
+eidbruch,elite_noneg
+eidbrüchigkeit,elite_noneg
 lobby,elite_eco
 lobbyismus,elite_eco
 klientelpolitik,elite_noneg
@@ -232,7 +234,6 @@ berichterstatterin,elite_medien
 deutschlandfunk,elite_medien
 fernsehen,elite_medien
 investoren,elite_medien
-öffentlichkeit,elite_medien
 öffentlichrechtlich,elite_medien
 öffentlichreichtliche,elite_medien
 massenmedien,elite_medien
