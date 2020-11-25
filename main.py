@@ -515,9 +515,12 @@ def custom_lemma(doc):
 
 
 def content_analysis(directory, party="all", sample=None):
-    if os.path.isdir(directory):
-        print("Directory already exists.")
-        return
+
+    # if os.path.isdir(f'res_ca/{directory}'):
+    #     print("Directory already exists.")
+    #     return
+
+    Path(f"res_ca/{directory}/").mkdir(parents=False, exist_ok=False)
 
     doc_labels = load_data(party)
     if type(sample) == int:
@@ -568,7 +571,7 @@ def content_analysis(directory, party="all", sample=None):
 
 # %%
 if __name__ == "__main__":
-    df, labels = content_analysis('1125', party='all', sample=200)
+    df, labels = content_analysis('1125', party='all', sample=None)
     # ContentAnalysis.viz(gendocs(labels[0]), df.viz[0])
     # ContentAnalysis.viz(text, df.viz[0])
 
