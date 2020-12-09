@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 import requests
 import json
-from src.d00_utils import check
+# from src.d00_utils import check
 
 # %%
 query = """{
@@ -54,6 +54,11 @@ plural = json.loads(response.text)
 
 with open("mdbs_pluragraph_data_200731.json", "w") as f:
     json.dump(plural, f, indent=4, sort_keys=True)
+
+# %%
+# start from disk:
+with open('data/raw/mdbs_pluragraph_data_200731.json') as json_file:
+    plural = json.load(json_file)
 
 # %%
 def extract_values(obj, key):
@@ -139,35 +144,36 @@ for data in pol:
 
     politiker.append(res)
 
-politiker
+# politiker
 
 pd.set_option("display.max_columns", 200)
 
 # %%
 df = pd.DataFrame(politiker)
+df2 = df
 
 # with pd.option_context("display.max_rows", None, "max_colwidth", -1):
     # display(df)
 
 # %%
-df.to_csv('mdbs_plura_200731.csv', mode='w', index=False, sep=',', header=True)
+# df.to_csv('data/mdbs_plura_200731.csv', mode='w', index=False, sep=',', header=True)
 
 # %%
 # plura from disk:
-df = pd.read_csv('data/raw/mdbs/mdbs_plura_200731.csv')
+# df = pd.read_csv('data/raw/mdbs/mdbs_plura_200731.csv')
 
 # %%
 # merge metadata: pluragraph & abgeordnetenwatch
 
 # load wp 18 data
-df18 = pd.read_csv('data/raw/mdbs/mdbs_aw_wp18.csv')
+df18 = pd.read_csv('data/raw/mdbs_aw_wp18.csv')
 # df18 = pd.read_csv('projects/content_analysis/data/raw/mdbs/mdbs_aw_wp18.csv')
 df18['name'] = df18[['first_name', 'last_name']].apply(lambda x: ' '.join(x), axis=1)
 df18['WP18'] = True
 
 # %%
 # load wp19 data
-df19 = pd.read_csv('data/raw/mdbs/mdbs_aw_wp19.csv')
+df19 = pd.read_csv('data/raw/mdbs_aw_wp19.csv')
 df19['profile_url'] = df19['meta/url']
 df19['first_name'] = df19['personal/first_name']
 df19['last_name'] = df19['personal/last_name']
@@ -214,7 +220,7 @@ df['name_clean_'] = df['name_clean']
 
 # %%
 # load plugagraph data
-df2 = pd.read_csv('data/raw/mdbs/mdbs_plura_200731.csv', sep=',')
+# df2 = pd.read_csv('data/mdbs_plura_200731.csv', sep=',')
 
 # %%
 # remove titles for names in pluragraph df2
@@ -259,9 +265,9 @@ df_res.drop(columns=['name_clean_left', 'name_clean__left', 'name_right', 'name_
 # %%
 # fix formatting of links
 cols = ['identifier', 'profile', 'facebook', 'twitter', 'youtube', 'instagram', 'flickr']
-df_res.loc[:, cols] = df_res[cols].apply(lambda x: x.str.strip(']'))
-df_res.loc[:, cols] = df_res[cols].apply(lambda x: x.str.strip('['))
-df_res.loc[:, cols] = df_res[cols].apply(lambda x: x.str.replace("'", ''))
+# df_res.loc[:, cols] = df_res[cols].apply(lambda x: x.str.strip(']'))
+# df_res.loc[:, cols] = df_res[cols].apply(lambda x: x.str.strip('['))
+# df_res.loc[:, cols] = df_res[cols].apply(lambda x: x.str.replace("'", ''))
 
 
 # %%
@@ -336,7 +342,7 @@ df_res.name_res = df_res.name_res.str.lower()
 
 # %%
 # save dataframe as csv
-df_res.to_csv('mdbs_metadata_200802.csv', mode='w', index=False, sep=',', header=True)
-
+# df_res.to_csv('data/mdbs_metadata_200802.csv', mode='w', index=False, sep=',', header=True)
+df_res.to_pickle('data/mdbs_metadata.pkl')
 
 # %%

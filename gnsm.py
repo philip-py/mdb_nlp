@@ -11,6 +11,7 @@ import pandas as pd
 import pprint
 import gensim
 import pickle
+import os.path
 
 # with open('doc_labels_presse.pkl', 'rb') as f:
 # doc_labels_presse = pickle.load(f)
@@ -31,50 +32,72 @@ def gendocs(label):
 
 
 # %%
-# create gensim dict & BoW
+def create_dictionary(doc_labels, filename):
 
-lemmatizer = GermaLemma()
+    def pipe(label):
+        doc = nlp(gendocs(label))
+        res = []
 
-from src.d01_ana.analysis import load_data, gendocs
-def lemma_getter(token):
-    try:
-        return lemmatizer.find_lemma(token.text, token.tag_)
-    except:
-        return token.lemma_
+        for i, sent in enumerate(doc.sents):
+            for j, token in enumerate(sent):
+                Token.set_extension('lemma', getter=lemma_getter, force=True)
+                if not token.is_punct and not token.is_digit and not token.is_space:
+                    tok = token._.lemma.lower()
+                    tok = tok.replace('.', '')
+                    res.append(tok)
 
-# doc_list = (gendocs(label) for label in doc_labels[:10])
+        return res
+
+    if os.path.isfile(filename):
+        print('File already exists!')
+        return
+
+    # create gensim dict & BoW
+    lemmatizer = GermaLemma()
+
+    from src.d01_ana.analysis import load_data, gendocs
+    def lemma_getter(token):
+        try:
+            return lemmatizer.find_lemma(token.text, token.tag_).lower()
+        except:
+            return token.lemma_.lower()
+
+    # doc_labels = random.sample(doc_labels, 100)
+
+    nlp = spacy.load("de_core_news_lg")
+
+    docs = (pipe(label) for label in doc_labels)
+    # tokens = [(token for token in doc) for doc in docs]
+    tokens = ((token for token in doc) for doc in docs)
+    dictionary = corpora.Dictionary()
+
+    BoW_corpus = [dictionary.doc2bow(token, allow_update=True) for token in tokens]
+
+    dictionary.save(filename)
+
+    return dictionary
+
+dictionary = create_dictionary(doc_labels, 'plenar_dict.pkl')
 
 
-def pipe(label):
-    doc = nlp(gendocs(label))
-    res = []
-
-    for i, sent in enumerate(doc.sents):
-        for j, token in enumerate(sent):
-            Token.set_extension('lemma', getter=lemma_getter, force=True)
-            if not token.is_punct and not token.is_digit and not token.is_space:
-                tok = token._.lemma.lower()
-                tok = tok.replace('.', '')
-                res.append(tok)
-
-    # print(res)
-    return res
-
-# sample = random.sample(doc_labels, 100)
 
 
-nlp = spacy.load("de_core_news_lg")
-
-docs = (pipe(label) for label in doc_labels)
-tokens = [(token for token in doc) for doc in docs]
-dictionary = corpora.Dictionary()
 
 
-# %%
-BoW_corpus = [dictionary.doc2bow(token, allow_update=True) for token in tokens]
 
-# %%
-dictionary.save('plenar_dict.pkl')
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 # %%
 dictionary.keys()

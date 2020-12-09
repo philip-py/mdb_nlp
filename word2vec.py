@@ -216,8 +216,7 @@ print(model.most_similar('volk'))
 
 # model = gensim.models.Word2Vec.load("/media/philippy/SSD/german.model")
 
-model = gensim.models.KeyedVectors.load_word2vec_format(
-    "/media/philippy/SSD/german.model", binary=True)
+model = gensim.models.KeyedVectors.load_word2vec_format("/media/philippy/SSD/german.model", binary=True)
 
 # %%
 model.save_word2vec_format("/media/philippy/SSD/german.w2v")

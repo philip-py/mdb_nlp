@@ -41,14 +41,15 @@ df = pd.concat(dfs)
 # %%
 # filter plenary speeches (exclude questions, zwischenrufe, etc.) and combine to list
 df_filter = df.loc[df['type'] == 'speech', :]
-df_text = df_filter.groupby(['speaker_key', 'top_id'], as_index=False)[
-    'text'].apply(list)
+# df_text = df_filter.groupby(['speaker_key', 'top_id'], as_index=False)['text'].apply(list)
+df_text = df_filter.groupby(['speaker_key', 'top_id'])['text'].agg(lambda x: list(x))
+# df_text = df_filter.groupby(['speaker_key', 'top_id'], as_index=False).text.apply(list)
 df_wp18 = pd.merge(pd.DataFrame(df_text), df_filter, on=[
                    'speaker_key', 'top_id'], how='inner')
 
 # speeches as contineous string
 df_wp18['text_clean'] = (
-    df_wp18[0]
+    df_wp18['text_x']
     .map(lambda x: [str(y) for y in x])
     .map(lambda x: ' '.join(x))
 )
@@ -67,7 +68,8 @@ df_wp18.loc[df_wp18['datum'].isna()]
 
 # %%
 # drop unnecessary columns, convert datum to datetime
-df_wp18.drop(labels=['Unnamed: 0', 'text', 0], axis=1, inplace=True)
+# df_wp18.drop(labels=['Unnamed: 0', 'text', 0], axis=1, inplace=True)
+df_wp18.drop(labels=['Unnamed: 0', 'text_x', 'text_y'], axis=1, inplace=True)
 df_wp18['datum'] = pd.to_datetime(df_wp18['datum'])
 df_wp18.sort_values(by='datum').iloc[[0, -1]]
 
@@ -222,7 +224,8 @@ len(df_all)
 
 # %%
 # - merge with metadata
-df = pd.read_csv('data/mdbs_metadata.csv')
+# df = pd.read_csv('data/mdbs_metadata.csv')
+df = pd.read_pickle('data/mdbs_metadata.pkl')
 df_plenar = df_all
 
 
@@ -414,7 +417,7 @@ print(df_clean.shape)
 
 
 # %%
-'''save metadata as JSON'''
+# save metadata as JSON
 df_clean = df_clean.set_index('filename')
 df_clean.loc[:, df_clean.columns != 'text'].to_json(
     'data/plenar_meta.json', orient='index')
@@ -425,7 +428,6 @@ df_clean.loc[:, df_clean.columns != 'text'].to_json(
 
 # %%
 # check
-
 json_file = 'plenar_meta.json'
 with open(json_file) as json_data:
     data = json.load(json_data)

@@ -1,13 +1,12 @@
-#%%
-# 2do:
-# DO THE EVALUATION WITH 50 TEXTS
-# FINAL CA!
+# %%
+# problemfälle: plenar_000786
+
 # FINISH THE EXPOSE!
 
-# problem souverän?
+# good example: 'plenar_029688'
+# eine automatische Analyse kann immer so gut sein wie die manuelle analyse, um sie zu validieren.
 
 # %%
-# import plac
 import spacy
 import pandas as pd
 from germalemma import GermaLemma
@@ -19,843 +18,22 @@ from spacy.pipeline import EntityRuler
 from spacy import displacy
 from spacy.tokens import DocBin
 from collections import Counter
-# from src.d01_ana.analysis import *
-from src.d00_utils.helper import chunks, flatten
+from src.d00_utils.helper import chunks, flatten, fix_umlauts, emb_fix_umlauts
+from src.d01_ana import Results, MyCorpus, LossLogger,EndOfTraining, SentimentRecognizer, EntityRecognizer, ContentAnalysis
+from src.d01_ana import load_data, gendocs, custom_extensions, recount_viz, compute_score_from_df, hash, intersect, merge_embeddings, load_models
 from spacy_sentiws import spaCySentiWS
-from math import fabs
+from math import fabs, log
 from tqdm import tqdm
 from gensim.models import tfidfmodel
+from pathlib import Path
 import pickle
 import json
 import random
+import copy
+from transformers import pipeline
 
-negation_words = set(["nie", "keinsterweise", "keinerweise", "niemals", "nichts", "kaum", "keinesfalls", "ebensowenig", "nicht", "kein", "keine", "weder"])
-negation_cconj = set(['aber', 'jedoch', 'doch', 'sondern'])
-sentiws = spaCySentiWS(sentiws_path='sentiws/')
+def content_analysis(directory, party="all", sample=None, window_size=25, debug=False):
 
-
-class SentimentRecognizer(object):
-
-    name = "sentiment_recognizer"
-
-    def __init__(self, nlp):
-        self.load_dicts()
-        # Token.set_extension('is_neg', default=False, force=True)
-        # Token.set_extension('is_pos', default=False, force=True)
-        Token.set_extension("is_neg", getter=self.is_neg_getter, force=True)
-        Token.set_extension("is_pos", getter=self.is_pos_getter, force=True)
-        Token.set_extension("is_negated", getter=self.is_negated_getter, force=True)
-        Doc.set_extension("has_neg", getter=self.has_neg, force=True)
-        Doc.set_extension("has_pos", getter=self.has_pos, force=True)
-        Span.set_extension("has_neg", getter=self.has_neg, force=True)
-        Span.set_extension("has_pos", getter=self.has_pos, force=True)
-
-    def __call__(self, doc):
-        return doc
-
-    def is_neg_getter(self, token):
-        if token._.lemma in self.negativ:
-            if token._.is_negated:
-                return False
-            else:
-                return True
-        if token._.lemma in self.positiv:
-            if token._.is_negated:
-                return True
-            else:
-                return False
-
-    def is_pos_getter(self, token):
-        if token._.lemma in self.positiv:
-            if token._.is_negated:
-                return False
-            else:
-                return True
-        if token._.lemma in self.negativ:
-            if token._.is_negated:
-                return True
-            else:
-                return False
-
-    def is_negated_getter(self, token):
-
-        check = list(token.children)
-        node = token
-        while node.head:
-            seen = node
-            if seen == node.head:
-                break
-            check.append(node)
-            check.extend(list(node.children))
-            if node.head.dep_ == "pd" or node.head.dep_ == "root" or node.head.dep_ == 'rc' or node.head.dep_ == 'oc':
-                check.append(node.head)
-                break
-            else:
-                node = node.head
-        attr = [
-            child for child in check if child.dep_ == "ng" or child._.lemma in negation_words
-        ]
-        if attr:
-            return True
-        else:
-            return False
-
-    def load_dicts(self):
-        dict_folder = "dict"
-        sent = pd.read_csv(f"{dict_folder}/SentDict.csv")
-        self.positiv = set([
-                x.strip()
-                for x in sent.loc[sent.sentiment == 1, ["feature"]]["feature"].tolist()
-        ])
-        self.negativ = set([
-                x.strip()
-                for x in sent.loc[sent.sentiment == -1, ["feature"]]["feature"].tolist()
-        ])
-
-    def has_neg(self, tokens):
-        return any([t._.get("is_neg") for t in tokens])
-
-    def has_pos(self, tokens):
-        return any([t._.get("is_pos") for t in tokens])
-
-
-class EntityRecognizer(object):
-
-    name = "entity_recognizer"
-
-    def __init__(self, nlp):
-        self.load_dicts()
-        self.ruler = EntityRuler(nlp, overwrite_ents=True, phrase_matcher_attr="LOWER")
-        self.vocab = nlp.vocab
-        patterns = []
-        for term in self.dict_people:
-            patterns.append({"label": "PEOPLE", "pattern": [{"_": {"lemma": term}}]})
-        for term in self.dict_elite:
-            patterns.append({"label": "ELITE", "pattern": [{"_": {"lemma": term}}]})
-        for term in self.dict_elite_standalone:
-            patterns.append(
-                {"label": "ELITE_STANDALONE", "pattern": [{"_": {"lemma": term}}]}
-            )
-        for term in self.dict_people_ord:
-            patterns.append(
-                {"label": "PEOPLE_ORD", "pattern": [{"_": {"lemma": term}}]}
-            )
-        for term in self.dict_people_ger:
-            patterns.append(
-                {"label": "PEOPLE_GER", "pattern": [{"_": {"lemma": term}}]}
-            )
-        for term in self.dict_attr_ord:
-            patterns.append({"label": "ATTR_ORD", "pattern": [{"_": {"lemma": term}}]})
-        for term in self.dict_attr_ger:
-            patterns.append({"label": "ATTR_GER", "pattern": [{"_": {"lemma": term}}]})
-        self.ruler.add_patterns(patterns)
-        # self.ruler.add_patterns([{'label': 'ELITE', 'pattern': 'europäische union'}])
-
-        Token.set_extension("is_volk", default=False, force=True)
-        Token.set_extension("is_elite", default=False, force=True)
-        Token.set_extension("is_elite_neg", default=False, force=True)
-        Token.set_extension("is_attr", default=False, force=True)
-        Doc.set_extension("has_volk", getter=self.has_volk, force=True)
-        Doc.set_extension("has_elite", getter=self.has_elite, force=True)
-        Span.set_extension("has_volk", getter=self.has_volk, force=True)
-        Span.set_extension("has_elite", getter=self.has_elite, force=True)
-
-    def __call__(self, doc):
-
-        matches = self.ruler.matcher(doc)
-        # matches.extend(self.ruler.phrase_matcher(doc))
-        spans = []
-        for id, start, end in matches:
-            entity = Span(doc, start, end, label=self.vocab.strings[id])
-            spans.append(entity)
-        filtered = filter_spans(spans)
-        for entity in filtered:
-            # People setter
-            if entity.label_ == "PEOPLE":
-                for token in entity:
-                    token._.set("is_volk", True)
-            if entity.label_ == "PEOPLE_ORD":
-                for token in entity:
-                    check = list(token.children)
-                    attr = set(
-                        [
-                            child
-                            for child in check
-                            if child._.lemma.lower() in self.dict_attr_ord
-                        ]
-                    )
-                    if attr:
-                        token._.set("is_volk", True)
-                        for child in attr:
-                            child._.set("is_volk", True)
-                            child._.set("is_attr", True)
-            if entity.label_ == "PEOPLE_GER" or entity.label_ == "PEOPLE_ORD":
-                for token in entity:
-                    check = list(token.children)
-                    attr = set(
-                        [
-                            child
-                            for child in check
-                            if child._.lemma.lower() in self.dict_attr_ger
-                        ]
-                    )
-                    if attr:
-                        token._.set("is_volk", True)
-                        for child in attr:
-                            child._.set("is_volk", True)
-                            child._.set("is_attr", True)
-            # Elite setter
-            if entity.label_ == "ELITE":
-                for token in entity:
-                    token._.set("is_elite", True)
-
-                    check = list(token.children)
-                    node = token
-                    while node.head:
-                        seen = node
-                        for t in node.children:
-                            if t.dep_ == "conj":
-                                break
-                            check.append(t)
-                            # for tok in t.children:
-                            # #     check.append(tok)
-                            #     if tok.dep_ == "pd":
-                            #         check.append(tok)
-                            #     elif tok.dep_ == "mo":
-                            #         check.append(tok)
-                            #     elif tok.dep_ == "oa":
-                            #         check.append(tok)
-                            #     elif tok.dep_ == "oa2":
-                            #         check.append(tok)
-                            #     elif tok.dep_ == "og":
-                            #         check.append(tok)
-                            #     elif tok.dep_ == "da":
-                            #         check.append(tok)
-                            #     elif tok.dep_ == "op":
-                            #         check.append(tok)
-                            #     elif tok.dep_ == "cc":
-                            #         check.append(tok)
-                            #     elif tok.dep_ == 'avc':
-                            #         check.append(tok)
-                            #     elif tok.dep_ == 'app':
-                            #         check.append(tok)
-                            #     elif tok.dep_ == 'adc':
-                            #         check.append(tok)
-                            #     elif tok.dep_ == 'ag':
-                            #         check.append(tok)
-                        check.append(node)
-                        # print(check)
-                        # check.extend(list(node.children))
-                        if node.head.dep_ == "pd" or node.head.dep_ == "root" or node.head.dep_ == 'rc' or node.head.dep_ == 'oc':
-                            check.append(node.head)
-                            break
-                        if node.head.pos_ == 'CCONJ' and node.head.text in negation_cconj:
-                            check.append(node.head)
-                            break
-                        if seen == node.head:
-                            break
-                        else:
-                            node = node.head
-                    attr = set([child for child in check if child._.is_neg])
-                    if attr:
-                        token._.set("is_elite_neg", True)
-                        for child in attr:
-                            child._.set("is_elite_neg", True)
-                            child._.set("is_attr", True)
-
-            # if entity.label_ == "ELITE" or entity.label_ == "ELITE_STANDALONE":
-            if entity.label_ == "ELITE_STANDALONE":
-                for token in entity:
-                    token._.set("is_elite", True)
-                    if not token._.is_negated:
-                        token._.set("is_elite_neg", True)
-            doc.ents = list(doc.ents) + [entity]
-        # nach content analyse?
-        # for span in filtered:
-        # span.merge()
-        return doc
-
-    def load_dicts(self):
-        dict_folder = "dict"
-        # import all dicts
-        # elite
-        df_elite = pd.read_csv(f"{dict_folder}/elite_dict.csv")
-        self.dict_elite = set(
-            df_elite[df_elite.type != "elite_noneg"]["feature"].tolist()
-        )
-        self.dict_elite_standalone = set(
-            df_elite[df_elite.type == "elite_noneg"]["feature"].tolist()
-        )
-
-        # people
-        df_people = pd.read_csv(f"{dict_folder}/people_dict.csv")
-        self.dict_people = set(
-            df_people[df_people.type == "people"]["feature"].tolist()
-        )
-        self.dict_people_ord = set(
-            df_people[df_people.type == "people_ordinary"]["feature"].tolist()
-        )
-        self.dict_attr_ord = set(
-            df_people[df_people.type == "attr_ordinary"]["feature"].tolist()
-        )
-        self.dict_people_ger = set(
-            df_people[df_people.type == "people_ger"]["feature"].tolist()
-        )
-        self.dict_attr_ger = set(
-            df_people[df_people.type == "attr_ger"]["feature"].tolist()
-        )
-
-        # testing:
-        # self.dict_people.add("wir sind das volk")
-        # self.dict_elite.add("europäische union")
-
-
-    # getters
-    def has_volk(self, tokens):
-        return any([t._.get("is_volk") for t in tokens])
-
-    def has_elite(self, tokens):
-        return any([t._.get("is_elite") for t in tokens])
-
-
-class ContentAnalysis(object):
-    "Runs Content Analysis as spacy-pipeline-component"
-    name = "content_analysis"
-
-    def __init__(self, nlp):
-        self.nlp = nlp
-        self.dictionary = pickle.load(open("plenar_dict.pkl", "rb"))
-        # self.dictionary = None
-        # Results()
-        # self.res = []
-        self.results = Results()
-
-        Span.set_extension(
-            "has_elite_neg", getter=self.has_elite_neg_getter, force=True
-        )
-        Span.set_extension(
-            "has_volk", getter=self.has_volk_getter, force=True
-        )
-
-    def __call__(self, doc):
-        res = {
-            "viz": [],
-            "volk": [],
-            "volk_attr": [],
-            "elite": [],
-            "elite_attr": [],
-        }
-
-        ##########################################
-        window_size = 25
-        # idf_weight = 1.0
-        ##########################################
-
-        matcher = Matcher(self.nlp.vocab)
-        pattern = [{"_": {"is_elite_neg": True}}]
-        matcher.add("text", None, pattern)
-        matches = matcher(doc)
-        doclen = len(doc)
-
-        spans = set()
-        token_ids = set()
-        ps_counter = 1
-        last_start = None
-        for id, start, end in matches:
-            if start - window_size < 0:
-                start = 0
-            else:
-                start = start - window_size
-            if end + window_size > doclen:
-                end = doclen
-            else:
-                end = end + window_size
-            sentence_start = doc[start].sent.start
-            sentence_end = doc[end-1].sent.end
-            # span = doc[start - window_size : end + window_size]
-            span = doc[sentence_start : sentence_end]
-            spans.add(span)
-        for span in spans:
-            if span._.has_elite_neg and span._.has_volk:
-                span_sentiment = sum([token._.sentiws for token in span if token._.sentiws])
-                if span_sentiment > 0.0:
-                    pass
-                    # print(span_sentiment)
-                    # print(span.text)
-                else:
-                    for token in span:
-                        if token._.is_volk:
-                            # res["viz"].append(ContentAnalysis.get_viz(token, doclen, "V", idf_weight, dictionary=self.dictionary))
-                            if token._.is_attr and token.i not in token_ids:
-                                res["volk_attr"].append(token._.lemma)
-                                res['viz'].append(self.on_hit(token, 'VA'))
-                                token_ids.add((token.i, "VA"))
-                            else:
-                                if token.i not in token_ids:
-                                    res["volk"].append(token._.lemma)
-                                    res['viz'].append(self.on_hit(token, 'V'))
-                                    token_ids.add((token.i, "V"))
-
-                        if token._.is_elite_neg:
-                            # res["viz"].append(ContentAnalysis.get_viz(token, doclen, "E", idf_weight, dictionary=self.dictionary))
-                            if token._.is_attr and token.i not in token_ids:
-                                res["elite_attr"].append(token._.lemma)
-                                res['viz'].append(self.on_hit(token, 'EA'))
-                                token_ids.add((token.i, "EA"))
-                            else:
-                                if token.i not in token_ids:
-                                    res["elite"].append(token._.lemma)
-                                    res['viz'].append(self.on_hit(token, 'E'))
-                                    token_ids.add((token.i, "E"))
-
-        # sorts by start AND deletes duplicates!
-        res["viz"] = sorted(
-            [dict(t) for t in {tuple(d.items()) for d in res["viz"]}],
-            key=lambda i: i["start"],
-        )
-        # res["c_elite"] = Counter(res["elite"])
-        # self.res["token_ids"] = token_ids
-        # res['doclen'] = doclen
-        self.results.doclens.append(doclen)
-        self.results.viz.append(res['viz'])
-        # self.res.append(res)
-        return doc
-
-    # getters
-    def has_elite_neg_getter(self, tokens):
-        return any([t._.get("is_elite_neg") for t in tokens])
-
-    def has_volk_getter(self, tokens):
-        return any([t._.get("is_volk") for t in tokens])
-
-    def on_hit(self, token, label):
-        start = token.idx
-        end = token.idx + len(token.text) + 1
-        lemma = token._.lemma
-        score = 0.0
-        # label = f"{label} | {score:.2f}"
-        res = {"start": start, "end": end, "label": label, "score": score, "lemma": lemma, "pos": token.pos_, "dep" : token.dep_, "index": token.i, "ent": token.ent_type_, "sent": token._.sentiws, "idf": self.get_idf(lemma), 'negated': token._.is_negated}
-        return res
-
-    def get_idf(self, term, idf_weight=1.0):
-        df = self.dictionary.dfs[self.dictionary.token2id[term.lower()]]
-        return tfidfmodel.df2idf(df, self.dictionary.num_docs, log_base=2.0, add=1.0) ** idf_weight
-
-    @staticmethod
-    def get_viz(token, doclen, label, idf_weight, dictionary=None):
-        start = token.idx
-        end = token.idx + len(token.text) + 1
-        # token = token._.lemma
-        if dictionary:
-            score = ContentAnalysis.compute_score_per_term(token, doclen, idf_weight, dictionary)
-        else:
-            score = 0.0
-        label = f"{label} | {score:.2f}"
-        return {"start": start, "end": end, "label": label, "lemma": token._.lemma, 'pos': token._.pos_, 'dep' : token._.dep_}
-
-
-    @staticmethod
-    def get_viz_start(doc, token, label):
-        start_id = token.i
-        if start_id != 0:
-            start_id =- 1
-        tok = doc[start_id]
-        start = tok.idx
-        end = tok.idx + len(tok.text)
-        label = f"{label}"
-        return {"start": start, "end": end, "label": label}
-
-
-    @staticmethod
-    def viz(text, row):
-        """visualize documents with displacy"""
-        if isinstance(row, pd.DataFrame):
-            display(row)
-            viz = row.viz[0]
-            ex = [
-                {
-                    "text": text,
-                    "ents": viz,
-                    "title": f"{row['doc'][0]} | {row.name_res[0]} ({row['party'][0]}) | {row['date'][0].strftime('%d/%m/%Y')}",
-                    # "title": "test",
-                }
-            ]
-
-        else:
-            ex = [
-                {
-                    "text": text,
-                    "ents": viz,
-                    "title": "TEXT",
-                }
-            ]
-
-        # find unique labels for coloring options
-        all_ents = {i["label"] for i in viz}
-        options = {"ents": all_ents, "colors": dict()}
-        for ent in all_ents:
-            if ent.startswith("E"):
-                options["colors"][ent] = "coral"
-            if ent.startswith("V"):
-                options["colors"][ent] = "lightgrey"
-            if ent.startswith("P"):
-                options["colors"][ent] = "yellow"
-
-        displacy.render(ex, style="ent", manual=True, jupyter=True, options=options)
-
-
-    @staticmethod
-    def compute_score_per_term(term, doclen, idf_weight, dictionary):
-        score = ContentAnalysis.compute_idf(term, idf_weight, dictionary)
-        ################################
-        res = score / log(doclen+10, 10)
-        ################################
-        return res
-
-
-    @staticmethod
-    def compute_idf(term, idf_weight=1.0, dictionary=None):
-        df = dictionary.dfs[dictionary.token2id[term.lower()]]
-        return tfidfmodel.df2idf(df, dictionary.num_docs, log_base=2.0, add=1.0) ** idf_weight
-
-
-    @staticmethod
-    def compute_score_from_counts(counts, doclen, idf_weight, dictionary):
-        scores = []
-        for term, n in counts.items():
-            score = ContentAnalysis.compute_score_per_term(term, doclen, idf_weight, dictionary)
-            scores.append(score * n)
-        res = sum(scores)
-        return res
-
-
-    @staticmethod
-    def recount_viz(viz, doclen, dictionary, idf_weight):
-        for i in viz:
-            score = compute_idf(i['lemma'], idf_weight, dictionary)
-            label = i['label']
-            i['label'] = label.replace(label.split('| ')[1], f'{score:.2f}')
-        return viz
-
-
-class Results:
-    """Saves relevant reslts of content analysis and contains mehtods for analysis & visualization"""
-    def __init__(self):
-        self.vocab = dict()
-        # id2token = {value : key for (key, value) in a_dictionary.items()}
-        self.labels = []
-        self.viz = []
-        self.doclens = []
-        self.scores = []
-        self.counts = []
-        self.entities = set()
-        self.meta_mdb = None
-        self.meta_plenar = None
-        self.df = None
-
-    def __repr__(self):
-        return 'results of Content Analysis'
-
-    def set_entities(self):
-        for doc in self.viz:
-            for hit in doc:
-                if hit['ent'] == '':
-                    hit['ent'] = 'ATTR'
-                self.entities.add(hit['ent'])
-
-    def load_meta():
-        # self.meta_mdb = pd.read_csv('data/mdbs_metadata.csv')
-        self.meta_plenar = pd.read_json('data/plenar_meta.json', orient='index')
-
-    def compute_score(self, idf_weight=2.0, sentiment_weight=1.0, doclen_weight=100):
-        scores = []
-        labels = ['E', 'EA', 'V', 'VA']
-        counts = []
-        for i, doc in enumerate(self.viz):
-            score_dict = {'score': 0.0}
-            count_dict = {}
-            for ent in self.entities:
-                score_dict[ent] = 0.0
-            for label in labels:
-                score_dict[label] = 0.0
-                count_dict[label] = Counter()
-            for hit in doc:
-                if not hit['sent']:
-                    hit['sent'] = 0.0
-                score = (hit['idf'] ** idf_weight) * ((1+fabs(hit['sent'])) ** sentiment_weight) / log(self.doclens[i]+doclen_weight, 10)
-                hit['score'] = score
-                score_dict['score'] += score
-                score_dict[hit['ent']] += score
-                score_dict[hit['label']] += score
-                count_dict[hit['label']].update([hit['lemma']])
-            # for label in labels:
-            #     count_dict[label] = Counter(count_dict[label])
-            counts.append(count_dict)
-            scores.append(score_dict)
-        self.scores = scores
-        self.counts = counts
-
-    def create_df(self):
-        # df = pd.DataFrame.from_dict({'doc': self.labels}, {'doclen': self.doclens}, {'scores': self.scores})
-        df = pd.DataFrame.from_dict({'doc': self.labels, 'doclen': self.doclens, 'scores': self.scores})
-        df = pd.concat([df.drop('scores', axis=1), df.scores.apply(pd.Series)], axis=1, sort=False)
-        self.df = df
-
-    def visualize(self, label):
-        id = self.labels.index(label)
-        text = gendocs(label)
-        # meta = self.meta_mdb.loc[]
-        Results.render(text, self.viz[id])
-
-    def add_meta_plenar(self):
-        df = pd.read_json("data/plenar_meta.json", orient="index")
-        # keep for future
-        # dfval_2 = pd.read_json('/media/philippy/SSD/data/ma/corpus/presse_meta.json', orient='index')
-        # dfval_3 = pd.read_json('/media/philippy/SSD/data/ma/corpus/twitter_meta.json', orient='index')
-        # dfval = dfval_1.append([dfval_2, dfval_3])
-        df["doc"] = df.index
-        df["doc"] = df.doc.apply(lambda x: x.split(".")[0])
-        # fix timestamps
-        df["date"] = df.datum
-        df["date"] = pd.to_datetime(df["date"], unit="ms", errors="ignore")
-        # merge results and meta
-        dfs = self.df.merge(df.loc[:, ["date", "party", "doc", "name_res", "gender", "election_list", "education", "birth_year"]], how="left", on="doc")
-        dfs = dfs.set_index("date").loc["2013-10-01":"2020-01-01"]
-        dfs["date"] = dfs.index
-        self.df = dfs
-
-    def evaluate_by_category(self, category, target):
-        grouped = self.df.groupby(category).mean().sort_values(target, ascending=False)
-        # mdbs_meta = pd.read_csv('data/mdbs_metadata.csv')
-        # res = pd.merge(grouped, mdbs_meta, how='left', on=category)
-        return grouped
-
-    def top_terms(self, cat=None, abs=True, party=None):
-        if party:
-            df = self.df.loc[self.df.party == party].copy()
-        else:
-            df = self.df.copy()
-        if abs:
-            labels = [i for i in df.doc]
-            ids = []
-            for label in labels:
-                ids.append(self.labels.index(label))
-            res = []
-            for i, count in enumerate(self.counts):
-                if i in ids:
-                    if cat:
-                        res.append(count[cat])
-                    else:
-                        res.extend(count.values())
-            # res = df.apply(lambda row: Counter(row.counts[cat]), axis=1)
-            res = sum([i for i in res], Counter())
-        else:
-            labels = [i for i in df.doc]
-            ids = []
-            for label in labels:
-                ids.append(self.labels.index(label))
-
-            score_dict = {}
-
-            for i, doc in enumerate(self.viz):
-                if i in ids:
-                    for hit in doc:
-                        if cat:
-                            if hit['label'] == cat:
-                                if hit['lemma'] not in score_dict:
-                                    score_dict[hit['lemma']] = 0.0
-                                score_dict[hit['lemma']] += hit['score']
-                        else:
-                            if hit['lemma'] not in score_dict:
-                                score_dict[hit['lemma']] = 0.0
-                            score_dict[hit['lemma']] += hit['score']
-            res = score_dict
-
-        return dict(sorted(res.items(), key=lambda x: x[1], reverse=True))
-
-    @staticmethod
-    def render(text, row):
-        """visualize documents with displacy"""
-        if isinstance(row, pd.DataFrame):
-            display(row)
-            viz = row.viz[0]
-            ex = [
-                {
-                    "text": text,
-                    "ents": viz,
-                    "title": f"{row['doc'][0]} | {row.name_res[0]} ({row['party'][0]}) | {row['date'][0].strftime('%d/%m/%Y')}",
-                    # "title": "test",
-                }
-            ]
-
-        else:
-            viz = row
-            for hit in viz:
-                hit['label'] = f"{hit['label']} | {hit['score']:.2f}"
-            ex = [
-                {
-                    "text": text,
-                    "ents": viz,
-                    "title": "TEXT",
-                }
-            ]
-
-        # find unique labels for coloring options
-        all_ents = {i["label"] for i in viz}
-        options = {"ents": all_ents, "colors": dict()}
-        for ent in all_ents:
-            if ent.startswith("E"):
-                options["colors"][ent] = "coral"
-            if ent.startswith("V"):
-                options["colors"][ent] = "lightgrey"
-            if ent.startswith("P"):
-                options["colors"][ent] = "yellow"
-
-        displacy.render(ex, style="ent", manual=True, jupyter=True, options=options)
-
-
-def load_data(party):
-    with open("data/doc_labels_plenar.pkl", "rb") as f:
-        doc_labels_plenar = pickle.load(f)
-
-    # doc_labels = [*doc_labels_presse, *doc_labels_twitter, *doc_labels_plenar]
-
-    doc_labels = [*doc_labels_plenar]
-
-    if party == "all":
-        return doc_labels
-
-    df = pd.read_json("data/plenar_meta.json", orient="index")
-    res = df.loc[df.party == party].index.values
-    doc_labels = [i.split(".txt")[0] for i in res]
-    # return random.sample(doc_labels, 1)
-    return doc_labels
-
-
-def gendocs(label):
-    with open("data/corpus_clean/{}.txt".format(label), "r") as text_file:
-        return text_file.read()
-
-
-def custom_lemma(doc):
-
-    lemmatizer = GermaLemma()
-
-    def lemma_getter(token):
-        # if " " in token.text:
-        #     return token.lemma_.lower()
-        try:
-            return lemmatizer.find_lemma(token.text, token.tag_).lower()
-        except:
-            return token.lemma_.lower()
-
-    Token.set_extension("lemma", getter=lemma_getter, force=True)
-    return doc
-
-
-def custom_extensions(doc):
-
-    negation_words = set(["nie", "keinsterweise", "keinerweise", "niemals", "nichts", "kaum", "keinesfalls", "ebensowenig", "nicht", "kein", "keine", "weder"])
-    negation_cconj = set(['aber', 'jedoch', 'doch', 'sondern'])
-
-    def is_negation_getter(token):
-        if token._.lemma in negation_words:
-            return True
-        else:
-            return False
-
-    def is_sentence_break_getter(token):
-        if token._.lemma in negation_cconj:
-            return True
-        else:
-            return False
-
-    Token.set_extension("is_negation", getter=is_negation_getter, force=True)
-
-    Token.set_extension("is_sentence_break", getter=is_sentence_break_getter), force=True)
-
-    return doc
-
-
-def recount_viz(df, dictionary, idf_weight):
-    df['viz'] = df.apply(lambda row: ContentAnalysis.recount_viz(row['viz'], row['doclen'], dictionary, idf_weight), axis=1)
-
-
-def compute_score_from_df(df, dictionary, idf_weight=1.0):
-    cols = ['viz', 'volk', 'volk_attr', 'elite', 'elite_attr']
-    for col in cols:
-        df[col] = df.apply(lambda row: eval(str(row[col])), axis=1)
-    for col in cols[1:]:
-        df[f'c_{col}'] = df.apply(lambda row: Counter(row[col]), axis=1)
-        df[f'score_{col}'] = df.apply(lambda row: ContentAnalysis.compute_score_from_counts(row[f'c_{col}'], row['doclen'], idf_weight, dictionary), axis=1)
-    df['score'] = df.apply(lambda row: sum([row[f'score_{col}'] for col in cols[1:]]), axis=1)
-
-
-def evaluate_by_category(category, target, df):
-    grouped = df.groupby(category).mean().sort_values(target, ascending=False)
-    mdbs_meta = pd.read_csv('data/mdbs_metadata.csv')
-    res = pd.merge(grouped, mdbs_meta, how='left', on=category)
-    display(res)
-
-
-def serialize(directory, party='all', sample=None):
-
-    Path(f"nlp/{directory}/docs").mkdir(parents=True, exist_ok=False)
-
-    doc_labels = load_data(party)
-    if type(sample) == int:
-        doc_labels = random.sample(doc_labels, sample)
-        text = None
-    elif type(sample) == str:
-        doc_labels = ['test']
-        text = sample
-    elif type(sample) == list:
-        doc_labels = sample
-        text = None
-    else:
-        text = None
-    print("Number of documents: {}".format(len(doc_labels)))
-    print(f"Beginning Serialization with parameters: \n Party: {party}")
-    nlp = spacy.load("de_core_news_lg")
-    ca = ContentAnalysis(nlp)
-    entity_recognizer = EntityRecognizer(nlp)
-    sentiment_recognizer = SentimentRecognizer(nlp)
-    # nlp.add_pipe(ca, last=True)
-    nlp.add_pipe(custom_lemma, last=True)
-    nlp.add_pipe(sentiment_recognizer, last=True)
-    nlp.add_pipe(entity_recognizer, last=True)
-    nlp.remove_pipe("ner")
-    labels = []
-    # doc_bin = DocBin(attrs=["LEMMA", "POS", "DEP", "ENT_TYPE"], store_user_data=True)
-    for label in tqdm(doc_labels):
-        labels.append(label)
-        if text:
-            doc = nlp(text)
-
-        else:
-            doc = nlp(gendocs(label))
-        # json_doc = doc.to_json(['has_volk', 'has_elite'])
-        # doc_bin.add(doc)
-        # with open(f'nlp/test/{label}.json', 'w') as outfile:
-        #     json.dump(json_doc, outfile)
-        doc_bytes = doc.to_bytes()
-        with open(f'nlp/{directory}/docs/{label}', 'wb') as f:
-            f.write(doc_bytes)
-    # nlp.to_disk('nlp/test')
-    # data = doc_bin.to_bytes()
-    # with open(f'nlp/{directory}/docs_plenar', 'wb') as f:
-    #     f.write(data)
-    nlp.vocab.to_disk(f'nlp/{directory}/vocab.txt')
-    with open(f'nlp/{directory}/labels.pkl', 'wb') as f:
-        pickle.dump(labels, f)
-    print(f"Serialization complete. \nResults saved in nlp/{directory}/")
-
-
-def content_analysis(directory, party="all", sample=None, debug=False):
-
-    # if os.path.isdir(f'res_ca/{directory}'):
-    #     print("Directory already exists.")
-    #     return
     if directory != 'test':
         Path(f"res_ca/{directory}/").mkdir(parents=False, exist_ok=False)
 
@@ -872,16 +50,20 @@ def content_analysis(directory, party="all", sample=None, debug=False):
     else:
         text = None
     print("Number of documents: {}".format(len(doc_labels)))
-    print(f"Beginning Content Analysis with parameters: \n Party: {party}")
+    print(f"Beginning Content Analysis with parameters: \n party: {party} | samplesize: {sample} | windowsize: {window_size}")
     nlp = spacy.load("de_core_news_lg")
-    ca = ContentAnalysis(nlp)
+    ca = ContentAnalysis(nlp, window_size=window_size)
     entity_recognizer = EntityRecognizer(nlp)
     sentiment_recognizer = SentimentRecognizer(nlp)
+    sentiws = spaCySentiWS(sentiws_path='sentiws/')
+    # clf = TextClassification(nlp)
+    # nlp.add_pipe(custom_lemma, last=True)
+    nlp.add_pipe(custom_extensions, last=True)
+    nlp.add_pipe(sentiment_recognizer, last=True)
+    nlp.add_pipe(sentiws, last=True)
+    nlp.add_pipe(entity_recognizer, last=True)
     nlp.add_pipe(ca, last=True)
-    nlp.add_pipe(custom_lemma, before="content_analysis")
-    nlp.add_pipe(sentiment_recognizer, before="content_analysis")
-    nlp.add_pipe(sentiws, before='content_analysis')
-    nlp.add_pipe(entity_recognizer, before="content_analysis")
+    # nlp.add_pipe(clf, last=True)
     nlp.remove_pipe("ner")
     labels = []
     for label in tqdm(doc_labels):
@@ -890,7 +72,7 @@ def content_analysis(directory, party="all", sample=None, debug=False):
             doc = nlp(text)
             if debug:
                 for token in doc:
-                    print(token.text, token.ent_type_, token._.is_elite_neg, token._.is_attr, token._.is_negated)
+                    print(token.text, token.ent_type_, token._.is_elite_neg, token._.is_attr, token._.is_negated, 'lemma', token._.lemma)
         else:
             doc = nlp(gendocs(label))
         ca.results.labels.append(label)
@@ -903,19 +85,413 @@ def content_analysis(directory, party="all", sample=None, debug=False):
     return ca.results
     # return (ca.results, doc)
 
+def discourse_analysis(directory, party=None, iter=1, sample=None, **kwargs):
+    # %env PYTHONHASHSEED=0
+    sns.set_style('darkgrid')
+
+    logging.basicConfig(filename='w2v.log', format='%(asctime)s : %(levelname)s : %(message)s', level=logging.INFO)
+
+
+    if not os.path.isdir(directory):
+        print('Directory already exists.')
+        return
+
+    doc_labels = load_data(party)
+    if sample:
+        doc_labels = random.sample(doc_labels, sample)
+
+    print('Number of documents: {}'.format(len(doc_labels)))
+    sentences = MyCorpus(doc_labels)
+    print(f'Beginning Discourse Analysis with parameters: \n{kwargs}')
+
+    # model params
+    model = Word2Vec(
+    alpha=0.0025, min_alpha=0.00001, vector_size=300, epochs=300, seed=42, workers=8, hashfxn=hash, sorted_vocab=1, sg=1, hs=1, negative=0, sample=1e-4, **kwargs)
+
+    model.build_vocab(sentences)
+
+    # intersect
+    pre = KeyedVectors.load('wiki.model')
+    res = intersect(pre, model)
+    del pre
+
+    model.wv.add_vectors(range(model.wv.vectors.shape[0]), res, replace=True)
+
+    # ASSERT?
+
+    total_examples = model.corpus_count
+
+    for i in range(iter):
+        try:
+            seeds = random.choices(range(1_000_000), k=iter)
+            seed = seeds[i]
+            print(f'Seed in iteration {i}: {seed}')
+            model.seed = seed
+            loss_logger = LossLogger(party, i, directory)
+
+            # train
+            model.train(sentences, total_examples=total_examples, epochs=model.epochs, compute_loss=True, callbacks=[loss_logger])
+
+        except EndOfTraining:
+            print(f'End of Iteration: {i}')
+
+    print(f'Discourse Analysis complete. \nResults saved in {directory}/...')
+
 
 # %%
+# content analysis
 if __name__ == "__main__":
-    res = content_analysis('test', party='all', sample=10_000)
-    # res = pickle.load(open("res_ca/1127/results_all.pkl", "rb"))
-    res.set_entities()
-    res.compute_score()
-    res.create_df()
-    res.add_meta_plenar()
-    display(res.df)
+    dir = '1208_ws15'
+    res = content_analysis(f'{dir}', party='all', window_size=15, sample=None)
+    res.prepare(post=False)
+    with open(f'res_ca/{dir}/results_all.pkl', 'wb') as f:
+        pickle.dump(res, f)
+
+
+# %%
+# notebook
+pd.set_option('display.max_rows', 25)
+
+dir = '1208'
+with open(f'res_ca/{dir}/results_all_post_ger2.pkl', 'rb') as f:
+    res = pickle.load(f)
+
+res.coding_pop(idf_weight=2.0)
+res.df.sort_values('score', ascending=False).head(15)
+
+
+# %%
+res.top_spans(topn=5)
+
+# %%
+res.top_terms(party='DIE LINKE', abs=False, topn=20)
+
+# %%
+res.top_terms(party='AfD', abs=False, topn=20)
+
+# %%
+# timeseries visualization
+def timeseries(res):
+    viz = res.df.groupby(["party"]).resample("Q").mean().reset_index()
+    viz.drop(
+        viz[(viz["party"] == "Parteilos") | (viz["party"] == "Die blaue Partei")].index,
+        inplace=True,
+    )
+    viz2 = res.df.resample("Q").mean().reset_index()
+    import plotly.express as px
+    import plotly.graph_objects as go
+
+    fig = px.line(x=viz.date, y=viz.score, color=viz.party, title="Populism-Score")
+    fig.update_layout(width=1000, title_font_size=20)
+
+    colors = ["darkblue", "black", "blue", "green", "magenta", "gold", "red"]
+    for j, party in enumerate([i.name for i in fig.data]):
+        fig.data[j].line.color = colors[j]
+    fig.add_trace(
+        go.Scatter(
+            x=viz2.date,
+            y=viz2.score,
+            mode="lines",
+            name="Durchschnit / Quartal",
+            marker_symbol="pentagon",
+            line_width=5,
+            line_color="darkgrey",
+            line_dash="dash",
+        )
+    )
+    fig.layout.template = "plotly_white"
+    fig.layout.legend.title.text = "Partei"
+    fig.layout.xaxis.title.text = "Jahr"
+    fig.layout.yaxis.title.text = "Score"
+    fig.update_traces(hovertemplate="Score: %{y} <br>Jahr: %{x}")
+    for i in range(2, 7):
+        fig.data[i].visible = "legendonly"
+    fig.show()
+
+timeseries(res)
+
+
+#%%
+# regression
+import statsmodels.api as sm
+
+df_reg = res.df.copy()
+df_reg = df_reg.loc["2013-10-01":"2020-01-01"]
+reg = df_reg[["date", "score", "party", "birth_year"]].dropna()
+
+reg["year"] = reg["date"].dt.strftime("%y")
+reg["year"] = reg["year"].astype("int")
+reg["year"] = reg["year"] - 13
+reg["month"] = reg["date"].dt.strftime("%m")
+reg["month"] = reg["month"].astype("int")
+reg["is_summer"] = reg.apply(lambda row: sommerpause(row), axis=1)
+
+sm.add_constant(reg)
+
+regression = sm.Poisson.from_formula("score ~ C(party, Treatment('CDU')) + year", reg, missing="drop").fit()
+# regression = sm.Poisson.from_formula("score ~ C(party, Treatment('CDU')) + year * C(party, Treatment('CDU'))", reg, missing="drop").fit()
+
+sum = regression.summary()
+sum
+
+
+
+
+
+
+
+
+
+# %%
+for hit in res.viz[res.labels.index('plenar_024197')]:
+    # if hit['lemma'] == 'steuerzahler':
+    if hit['span_start'] == 2376:
+        print(hit['text'])
+
+
+
+
+# %%
+clf = pipeline("zero-shot-classification", model='joeddav/xlm-roberta-large-xnli', device=-1)
+
+#%%
+with open(f'res_ca/test/results_all.pkl', 'rb') as f:
+    res = pickle.load(f)
+
+# res_prepare(res, post=False)
+res.viz = clf_pop(clf, res)
+
+# %%
+with open(f'res_ca/1203/results_all_post.pkl', 'wb') as f:
+    pickle.dump(res, f)
+
+# %%
+res = pickle.load(open("res_ca/1203/results_all_clf.pkl", "rb"))
+res.set_entities()
+res.viz = coding(res)
+res.compute_score(by_doclen=True, idf_weight=1.5, doclen_log=10, post=True)
+res.compute_score_spans()
+res.create_df()
+res.add_meta_plenar()
+
+with open(f'res_ca/1203/results_all_post.pkl', 'wb') as f:
+    pickle.dump(res, f)
+
+# res = pickle.load(open("res_ca/1203/results_all_post.pkl", "rb"))
+
+# %%
+res.viz = clf_pop_eu(clf, res)
+
+# %%
+with open(f'res_ca/test/results_all.pkl', 'wb') as f:
+    pickle.dump(res, f)
+
+# %%
+text = 'Nun könnte man argumentieren, dass wir unser Engagement lieber einstellen und die Kosovaren sich selbst überlassen sollten . Dieser Gedanke mag verführerisch sein, weil er so einfach klingt . Das wäre aber verheerend für die Sicherheit und die Stabilität Europas . Meine Überzeugung ist . Der Westbalkan ist ein wunder Punkt mitten in der Europäischen Union . deshalb muss die EU gerade im Zeitalter globaler Krisen für eine europäische Zukunft des Westbalkans stärker politisch handeln . Versetzen wir uns einmal in die Lage des Kosovo . Das Kosovo und seine Bevölkerung befinden sich in einem permanenten psychologischen Zustand der Ungleichheit in seiner Region, zum Beispiel bei der Frage der Visaliberalisierung .'
+
+
+
+# %%
+res = pickle.load(open("res_ca/plenar/results_all_post_fix.pkl", "rb"))
+res.prepare(post=False)
+
+# %%
+res.viz = coding(res)
+res.compute_score(by_doclen=True, idf_weight=1.0, doclen_log=10, post=True)
+res.compute_score_spans()
+res.create_df()
+res.add_meta_plenar()
+
+pd.set_option('display.max_rows', 50)
+res.df.sort_values('score', ascending=False).head(25)
+
+# %%
+span_sizes = []
+for span in res.spans.values():
+    for s in span.keys():
+        span_sizes.append(s[1] - s[0])
+
+max(span_sizes)
+
+
+
+
+# %%
+res_viz = clf_pop(res)
+res.viz = res_viz
+with open(f'res_ca/1201/results_all.pkl', 'wb') as f:
+    pickle.dump(res, f)
+
+# %%
+res = pickle.load(open("res_ca/plenar/results_all_post_fix.pkl", "rb"))
+res.set_entities()
+res.viz = coding(res)
+res.compute_score(by_doclen=True, idf_weight=1.0, doclen_log=10, post=True)
+res.compute_score_spans()
+res.create_df()
+res.add_meta_plenar()
+# res.top_spans(topn=5)
+# res.visualize('plenar_002901', filter_by=['score', 'SPAN_IS_POP', 'TOK_IS_POP'])
+
+pd.set_option('display.max_rows', 50)
+
+res.df.sort_values('score', ascending=False).head(25)
+
+
+# %%
+n=6
+res.visualize(res.top_spans()[n][0], res.top_spans()[n][1])
+
+# %%
+df = pd.read_json("data/plenar_meta.json", orient="index")
+df.loc['plenar_025593.txt']
+# %%
+res.df.sort_values('score', ascending=False)
+
+# %%
+# res.visualize('plenar_024364', filter_by=False)
+# res.visualize('plenar_002901', filter_by=False)
+# res.visualize('plenar_002901', filter_by=['score', 'SPAN_IS_POP', 'RLY_E'])
+# res.visualize('plenar_027415', filter_by=False)
+
+# %%
+res.top_spans(topn=5)
+
+# %%
+res.top_terms(party='DIE LINKE', abs=False, topn=20)
+
+# %%
+res.top_terms(party='AfD', abs=False, topn=20)
+
+# %%
+res.visualize('plenar_024364', span=(2320, 2908))
+
+# %%
+by_state = res.evaluate_by_category('election_list', 'score')
+by_state
+
+# %%
+def timeseries(res):
+    viz = res.df.groupby(["party"]).resample("Q").mean().reset_index()
+    viz.drop(
+        viz[(viz["party"] == "Parteilos") | (viz["party"] == "Die blaue Partei")].index,
+        inplace=True,
+    )
+    viz2 = res.df.resample("Q").mean().reset_index()
+    import plotly.express as px
+    import plotly.graph_objects as go
+
+    fig = px.line(x=viz.date, y=viz.score, color=viz.party, title="Populism-Score")
+    fig.update_layout(width=1000, title_font_size=20)
+
+    colors = ["darkblue", "black", "blue", "green", "magenta", "gold", "red"]
+    for j, party in enumerate([i.name for i in fig.data]):
+        fig.data[j].line.color = colors[j]
+    fig.add_trace(
+        go.Scatter(
+            x=viz2.date,
+            y=viz2.score,
+            mode="lines",
+            name="Durchschnit / Quartal",
+            marker_symbol="pentagon",
+            line_width=5,
+            line_color="darkgrey",
+            line_dash="dash",
+        )
+    )
+    fig.layout.template = "plotly_white"
+    fig.layout.legend.title.text = "Partei"
+    fig.layout.xaxis.title.text = "Jahr"
+    fig.layout.yaxis.title.text = "Score"
+    fig.update_traces(hovertemplate="Score: %{y} <br>Jahr: %{x}")
+    for i in range(2, 7):
+        fig.data[i].visible = "legendonly"
+    fig.show()
+
+timeseries(res)
+
+# %%
+import statsmodels.api as sm
+
+df_reg = res.df.copy()
+# change daterange?
+df_reg = df_reg.loc["2013-10-01":"2020-01-01"]
+# df_reg = df_reg.loc[df['pop'] == True]
+reg = df_reg[["date", "score", "party", "birth_year"]].dropna()
+
+def sommerpause(row):
+    if 7 < row.month < 9:
+        return "sommerpause"
+    else:
+        return "keine_sommerpause"
+
+
+reg["year"] = reg["date"].dt.strftime("%y")
+reg["year"] = reg["year"].astype("int")
+reg["year"] = reg["year"] - 13
+reg["month"] = reg["date"].dt.strftime("%m")
+reg["month"] = reg["month"].astype("int")
+reg["is_summer"] = reg.apply(lambda row: sommerpause(row), axis=1)
+
+sm.add_constant(reg)
+
+# regression = sm.Poisson.from_formula(
+    # "score ~ year * C(party, Treatment('CDU'))", reg, missing="drop"
+# ).fit()
+
+regression = sm.Poisson.from_formula("score ~ C(party, Treatment('CDU')) + year", reg, missing="drop").fit()
+# regression = sm.Poisson.from_formula("score ~ C(party, Treatment('CDU')) + year * C(party, Treatment('CDU'))", reg, missing="drop").fit()
+# res = sm.OLS.from_formula("score ~ C(opp, Treatment('not_opp'))", reg, missing='drop').fit()
+# res = sm.Poisson.from_formula("score ~ C(party, Treatment('CDU')) + date * C(party, Treatment('CDU'))", reg, missing='drop').fit()
+
+sum = regression.summary()
+sum
+
+# %%
+res.top_terms(party='AfD', abs=False, topn=20)
+# res.top_terms(party='DIE LINKE', abs=False, topn=20)
+
+
+# %%
+# load embeddings
+afd = merge_embeddings(load_models('AfD', iter=1))
+linke = merge_embeddings(load_models('DIE LINKE', iter=1))
+linke = emb_fix_umlauts(linke)
+
+# %%
+linke.wv.most_similar('bürger')
+
+# %%
+# save w2v-model to use gnsm-script
+# python -m gensim.scripts.word2vec2tensor -i ~/gensim-data/glove-wiki-gigaword-50/glove-wiki-gigaword-50.gz
+afd.wv.save_word2vec_format('model_afd', binary=False)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# %%
+res.visualize('plenar_029688')
+# res.visualize('plenar_029688', span=(3788, 4288))
+
+# %%
+res.visualize('plenar_029688', span=(6605, 7066))
 
 # %%
 res.df.groupby('party').mean()
+
+# %%
+res.df.sort_values(by='score', ascending=False).head()
 
 # %%
 pd.set_option('display.max_rows', 50)
@@ -1023,38 +599,223 @@ print(ca.res)
 
 
 # %%
-import statsmodels.api as sm
+def compute_score_spans(self):
+    span_dict = {}
+    # {doc: [(span_start, span_end, score_sum)]}
+    for i, doc in enumerate(self.viz):
+        label = self.labels[i]
+        span_dict[label] = {}
+        # scores = []
+        for hit in doc:
+            span_start = hit['span_start']
+            span_end = hit['span_end']
+            span_id = (span_start, span_end)
+            if span_id not in span_dict[label]:
+                span_dict[label][span_id] = 0.0
+            span_dict[label][span_id] += hit['score']
+    self.spans = span_dict
 
-df_reg = res.df.copy()
-# change daterange?
-df_reg = df_reg.loc["2013-10-01":"2020-01-01"]
-# df_reg = df_reg.loc[df['pop'] == True]
-reg = df_reg[["date", "score", "party", "birth_year"]].dropna()
-
-
-def sommerpause(row):
-    if 7 < row.month < 9:
-        return "sommerpause"
-    else:
-        return "keine_sommerpause"
-
-
-reg["year"] = reg["date"].dt.strftime("%y")
-reg["year"] = reg["year"].astype("int")
-reg["year"] = reg["year"] - 13
-reg["month"] = reg["date"].dt.strftime("%m")
-reg["month"] = reg["month"].astype("int")
-reg["is_summer"] = reg.apply(lambda row: sommerpause(row), axis=1)
-
-sm.add_constant(reg)
-
-# regression = sm.Poisson.from_formula(
-    # "score ~ year * C(party, Treatment('CDU'))", reg, missing="drop"
-# ).fit()
-regression = sm.Poisson.from_formula("score ~ C(party, Treatment('CDU')) + year", reg, missing="drop").fit()
-# res = sm.OLS.from_formula("score ~ C(opp, Treatment('not_opp'))", reg, missing='drop').fit()
-# res = sm.Poisson.from_formula("score ~ C(party, Treatment('CDU')) + date * C(party, Treatment('CDU'))", reg, missing='drop').fit()
-
-sum = regression.summary()
-sum
+Results.compute_score_spans = compute_score_spans
 # %%
+def visualize(self, label, span=None):
+    """visualize documents with displacy"""
+    row = self.df.loc[self.df['doc'] == label].copy()
+    text = gendocs(label)
+    viz = self.viz[self.labels.index(label)].copy()
+
+    if span:
+        viz_span = []
+        for hit in viz:
+            if hit['span_start'] == span[0]:
+                print(hit)
+                # hit['start'] -= span[0]
+                hit['end'] -= span[0]
+                hit['label'] = f"{hit['label']} | {hit['score']:.2f}"
+                viz_span.append(hit)
+            ex = [
+                {
+                    "text": text[span[0]: span[1]],
+                    "ents": viz_span,
+                    "title": f"{row['doc'][0]} | {row.name_res[0]} ({row['party'][0]}) | {row['date'][0].strftime('%d/%m/%Y')}",
+                }
+            ]
+        all_ents = {i["label"] for i in viz_span}
+        # print(ex)
+
+    else:
+        for hit in viz:
+            hit['label'] = f"{hit['label']} | {hit['score']:.2f}"
+            ex = [
+                {
+                    "text": text,
+                    "ents": viz,
+                    "title": f"{row['doc'][0]} | {row.name_res[0]} ({row['party'][0]}) | {row['date'][0].strftime('%d/%m/%Y')}",
+                }
+            ]
+        # find unique labels for coloring options
+        all_ents = {i["label"] for i in viz}
+
+    options = {"ents": all_ents, "colors": dict()}
+    for ent in all_ents:
+        if ent.startswith("E"):
+            options["colors"][ent] = "coral"
+        if ent.startswith("V"):
+            options["colors"][ent] = "lightgrey"
+        if ent.startswith("P"):
+            options["colors"][ent] = "yellow"
+
+    displacy.render(ex, style="ent", manual=True, jupyter=True, options=options)
+
+Results.visualize = visualize
+
+
+# %%
+res.visualize('plenar_029688', span=(3788, 4288))
+# %%
+all_spans = []
+for doc in res.spans.items():
+    for span in doc[1]:
+        all_spans.append((doc[0], span, res.spans[doc[0]][span]))
+all_spans.sort(key= lambda tup: tup[2], reverse=True)
+all_spans[:]
+# %%
+res.spans['plenar_023592'][(1382, 1892)]
+
+# %%
+
+# %%
+# with open(f'res_ca/1201/results_all_post.pkl', 'wb') as f:
+#     pickle.dump(res, f)
+
+def filter_res(res, label):
+    new_res = Results()
+    id = res.labels.index(label)
+    new_res.viz = [res.viz[id]]
+    new_res.labels = [res.labels[id]]
+    new_res.doclens = [res.doclens[id]]
+    new_res.scores = [res.scores[id]]
+    new_res.spans = {label: res.spans[label]}
+    return new_res
+
+new = filter_res(res, 'plenar_019293')
+
+# %%
+sample = {'plenar_000566',
+ 'plenar_000786',
+ 'plenar_001144',
+ 'plenar_001333',
+ 'plenar_001338',
+ 'plenar_001354',
+ 'plenar_001403',
+ 'plenar_001640',
+ 'plenar_001810',
+ 'plenar_002320',
+ 'plenar_002731',
+ 'plenar_002875',
+ 'plenar_002876',
+ 'plenar_002879',
+ 'plenar_002886',
+ 'plenar_002898',
+ 'plenar_002899',
+ 'plenar_003242',
+ 'plenar_003389',
+ 'plenar_003455',
+ 'plenar_004466',
+ 'plenar_004774',
+ 'plenar_005146',
+ 'plenar_005247',
+ 'plenar_005340',
+ 'plenar_005365',
+ 'plenar_005464',
+ 'plenar_005540',
+ 'plenar_005780',
+ 'plenar_005786',
+ 'plenar_006131',
+ 'plenar_006160',
+ 'plenar_006208',
+ 'plenar_006257',
+ 'plenar_006556',
+ 'plenar_008097',
+ 'plenar_008306',
+ 'plenar_009392',
+ 'plenar_009633',
+ 'plenar_009754',
+ 'plenar_009927',
+ 'plenar_010388',
+ 'plenar_010464',
+ 'plenar_010902',
+ 'plenar_010971',
+ 'plenar_010984',
+ 'plenar_011029',
+ 'plenar_011165',
+ 'plenar_011264',
+ 'plenar_011616',
+ 'plenar_011661',
+ 'plenar_012804',
+ 'plenar_013082',
+ 'plenar_013291',
+ 'plenar_013881',
+ 'plenar_014181',
+ 'plenar_014534',
+ 'plenar_014938',
+ 'plenar_015053',
+ 'plenar_015136',
+ 'plenar_015164',
+ 'plenar_015532',
+ 'plenar_016888',
+ 'plenar_018397',
+ 'plenar_018916',
+ 'plenar_018989',
+ 'plenar_019489',
+ 'plenar_019594',
+ 'plenar_019608',
+ 'plenar_020077',
+ 'plenar_020452',
+ 'plenar_020469',
+ 'plenar_020833',
+ 'plenar_021241',
+ 'plenar_021338',
+ 'plenar_021351',
+ 'plenar_021806',
+ 'plenar_022467',
+ 'plenar_023300',
+ 'plenar_023619',
+ 'plenar_023654',
+ 'plenar_023932',
+ 'plenar_023945',
+ 'plenar_024197',
+ 'plenar_024198',
+ 'plenar_024208',
+ 'plenar_024215',
+ 'plenar_024347',
+ 'plenar_024797',
+ 'plenar_024988',
+ 'plenar_025574',
+ 'plenar_025824',
+ 'plenar_026708',
+ 'plenar_026711',
+ 'plenar_026854',
+ 'plenar_026899',
+ 'plenar_026913',
+ 'plenar_026981',
+ 'plenar_027078',
+ 'plenar_027223',
+ 'plenar_027334',
+ 'plenar_027396',
+ 'plenar_027401',
+ 'plenar_027439',
+ 'plenar_027471',
+ 'plenar_027615',
+ 'plenar_027616',
+ 'plenar_027738',
+ 'plenar_027787',
+ 'plenar_028394',
+ 'plenar_028452',
+ 'plenar_028679',
+ 'plenar_029108',
+ 'plenar_029119',
+ 'plenar_029366',
+ 'plenar_029571',
+ 'plenar_029673'}
+
+#  ['plenar_024197', 'plenar_027439', 'plenar_029673', 'plenar_015136', 'plenar_029688']

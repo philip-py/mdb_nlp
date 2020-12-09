@@ -1,365 +1,974 @@
-# %%
-import sys
-import pickle
-import random
+import copy
 import spacy
-import logging
-import hashlib
-import glob
-import seaborn as sns
+import pickle
+import json
+import random
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-from math import log
-from pathlib import Path
-from collections import Counter
-from germalemma import GermaLemma
-from tqdm import tqdm
-from spacy.tokens import Doc, Span, Token
-from spacy.matcher import Matcher
-from spacy.tokens import Doc, Span, Token
-from spacy.lang.de.stop_words import STOP_WORDS
 from gensim.models import Word2Vec
 from gensim.models.callbacks import CallbackAny2Vec
 from gensim.scripts.glove2word2vec import glove2word2vec
 from gensim import utils
-from gensim.models import KeyedVectors
-from gensim.test.utils import datapath, get_tmpfile
+from germalemma import GermaLemma
+from spacy.matcher import Matcher
+from spacy.matcher import PhraseMatcher
+from spacy.tokens import Doc, Span, Token
+from spacy.util import filter_spans
+from spacy.pipeline import EntityRuler
+from spacy import displacy
+from spacy.tokens import DocBin
+from collections import Counter
+from src.d00_utils.helper import chunks, flatten, filter_spans_overlap, filter_spans_overlap_no_merge
+from spacy_sentiws import spaCySentiWS
+from math import fabs, log
+from tqdm import tqdm
 from gensim.models import tfidfmodel
-from src.d00_utils.helper import flatten
+from pathlib import Path
+from pprint import pprint
+from transformers import pipeline
 
-# %%
-class ContentAnalysis:
-    def __init__(self, model, dict_folder, directory):
 
-        self.nlp = spacy.load(model)
-        self.folder = directory
+class SentimentRecognizer(object):
 
-        Path(f'res_ca/{self.folder}/').mkdir(parents=False, exist_ok=False)
+    name = "sentiment_recognizer"
 
+    def __init__(self, nlp):
+        self.load_dicts()
+        # Token.set_extension('is_neg', default=False, force=True)
+        # Token.set_extension('is_pos', default=False, force=True)
+        Token.set_extension("is_neg", getter=self.is_neg_getter, force=True)
+        Token.set_extension("is_pos", getter=self.is_pos_getter, force=True)
+        Token.set_extension("is_negated", getter=self.is_negated_getter, force=True)
+        Token.set_extension("span_sent", default=None, force=True)
+        Doc.set_extension("has_neg", getter=self.has_neg, force=True)
+        Doc.set_extension("has_pos", getter=self.has_pos, force=True)
+        Span.set_extension("has_neg", getter=self.has_neg, force=True)
+        Span.set_extension("has_pos", getter=self.has_pos, force=True)
+
+    def __call__(self, doc):
+        return doc
+
+    def is_neg_getter(self, token):
+        if token._.lemma in self.negativ:
+            if token._.is_negated:
+                return False
+            else:
+                return True
+        if token._.lemma in self.positiv:
+            if token._.is_negated:
+                return True
+            else:
+                return False
+
+    def is_pos_getter(self, token):
+        if token._.lemma in self.positiv:
+            if token._.is_negated:
+                return False
+            else:
+                return True
+        if token._.lemma in self.negativ:
+            if token._.is_negated:
+                return True
+            else:
+                return False
+
+    def is_negated_getter(self, token):
+
+        check = list(token.children)
+        node = token
+        while node.head:
+            seen = node
+            if seen == node.head:
+                break
+            check.append(node)
+            check.extend(list(node.children))
+            if node.head.dep_ == "pd" or node.head.dep_ == "root" or node.head.dep_ == 'rc' or node.head.dep_ == 'oc':
+                check.append(node.head)
+                break
+            else:
+                node = node.head
+        attr = [
+            # child for child in check if child.dep_ == "ng" or child._.lemma in negation_words
+            child for child in check if child.dep_ == "ng" or child._.is_negation
+        ]
+        if attr:
+            return True
+        else:
+            return False
+
+    def load_dicts(self):
+        dict_folder = "dict"
+        sent = pd.read_csv(f"{dict_folder}/SentDict.csv")
+        self.positiv = set([
+                x.strip()
+                for x in sent.loc[sent.sentiment == 1, ["feature"]]["feature"].tolist()
+        ])
+        self.negativ = set([
+                x.strip()
+                for x in sent.loc[sent.sentiment == -1, ["feature"]]["feature"].tolist()
+        ])
+
+    def has_neg(self, tokens):
+        return any([t._.get("is_neg") for t in tokens])
+
+    def has_pos(self, tokens):
+        return any([t._.get("is_pos") for t in tokens])
+
+
+class EntityRecognizer(object):
+
+    name = "entity_recognizer"
+
+    def __init__(self, nlp):
+        self.load_dicts()
+        self.ruler = EntityRuler(nlp, overwrite_ents=True, phrase_matcher_attr="LOWER")
+        self.vocab = nlp.vocab
+        patterns = []
+        for term in self.dict_people:
+            patterns.append({"label": "PEOPLE", "pattern": [{"_": {"lemma": term}}]})
+        for term in self.dict_elite:
+            patterns.append({"label": "ELITE", "pattern": [{"_": {"lemma": term}}]})
+        for term in self.dict_elite_standalone:
+            patterns.append(
+                {"label": "ELITE_STANDALONE", "pattern": [{"_": {"lemma": term}}]}
+            )
+        for term in self.dict_people_ord:
+            patterns.append(
+                {"label": "PEOPLE_ORD", "pattern": [{"_": {"lemma": term}}]}
+            )
+        for term in self.dict_people_ger:
+            patterns.append(
+                {"label": "PEOPLE_GER", "pattern": [{"_": {"lemma": term}}]}
+            )
+        for term in self.dict_attr_ord:
+            patterns.append({"label": "ATTR_ORD", "pattern": [{"_": {"lemma": term}}]})
+        for term in self.dict_attr_ger:
+            patterns.append({"label": "ATTR_GER", "pattern": [{"_": {"lemma": term}}]})
+        self.ruler.add_patterns(patterns)
+        # self.ruler.add_patterns([{'label': 'ELITE', 'pattern': 'europäische union'}])
+
+        Token.set_extension("is_volk", default=False, force=True)
+        Token.set_extension("is_elite", default=False, force=True)
+        Token.set_extension("is_elite_neg", default=False, force=True)
+        Token.set_extension("is_attr", default=False, force=True)
+        Token.set_extension("attr_of", default=None, force=True)
+        Doc.set_extension("has_volk", getter=self.has_volk, force=True)
+        Doc.set_extension("has_elite", getter=self.has_elite, force=True)
+        Span.set_extension("has_volk", getter=self.has_volk, force=True)
+        Span.set_extension("has_elite", getter=self.has_elite, force=True)
+
+    def __call__(self, doc):
+
+        matches = self.ruler.matcher(doc)
+        # matches.extend(self.ruler.phrase_matcher(doc))
+        spans = []
+        for id, start, end in matches:
+            entity = Span(doc, start, end, label=self.vocab.strings[id])
+            spans.append(entity)
+        filtered = filter_spans(spans)
+        for entity in filtered:
+            # People setter
+            if entity.label_ == "PEOPLE":
+                for token in entity:
+                    token._.set("is_volk", True)
+            if entity.label_ == "PEOPLE_ORD":
+                for token in entity:
+                    check = list(token.children)
+                    attr = set(
+                        [
+                            child
+                            for child in check
+                            if child._.lemma.lower() in self.dict_attr_ord
+                        ]
+                    )
+                    if attr:
+                        token._.set("is_volk", True)
+                        for child in attr:
+                            child._.set("is_volk", True)
+                            child._.set("is_attr", True)
+                            child._.set("attr_of", token.idx)
+
+            if entity.label_ == "PEOPLE_GER" or entity.label_ == "PEOPLE_ORD":
+                for token in entity:
+                    check = list(token.children)
+                    attr = set(
+                        [
+                            child
+                            for child in check
+                            if child._.lemma.lower() in self.dict_attr_ger
+                        ]
+                    )
+                    if attr:
+                        token._.set("is_volk", True)
+                        for child in attr:
+                            child._.set("is_volk", True)
+                            child._.set("is_attr", True)
+                            child._.set("attr_of", token.idx)
+            # Elite setter
+            if entity.label_ == "ELITE":
+                for token in entity:
+                    token._.set("is_elite", True)
+
+                    check = list(token.children)
+                    node = token
+                    while node.head:
+                        seen = node
+                        for t in node.children:
+                            if t.dep_ == "conj":
+                                break
+                            check.append(t)
+                            # for tok in t.children:
+                            # #     check.append(tok)
+                            #     if tok.dep_ == "pd":
+                            #         check.append(tok)
+                            #     elif tok.dep_ == "mo":
+                            #         check.append(tok)
+                            #     elif tok.dep_ == "oa":
+                            #         check.append(tok)
+                            #     elif tok.dep_ == "oa2":
+                            #         check.append(tok)
+                            #     elif tok.dep_ == "og":
+                            #         check.append(tok)
+                            #     elif tok.dep_ == "da":
+                            #         check.append(tok)
+                            #     elif tok.dep_ == "op":
+                            #         check.append(tok)
+                            #     elif tok.dep_ == "cc":
+                            #         check.append(tok)
+                            #     elif tok.dep_ == 'avc':
+                            #         check.append(tok)
+                            #     elif tok.dep_ == 'app':
+                            #         check.append(tok)
+                            #     elif tok.dep_ == 'adc':
+                            #         check.append(tok)
+                            #     elif tok.dep_ == 'ag':
+                            #         check.append(tok)
+                        check.append(node)
+                        # print(check)
+                        # check.extend(list(node.children))
+                        if node.head.dep_ == "pd" or node.head.dep_ == "root" or node.head.dep_ == 'rc' or node.head.dep_ == 'oc':
+                            check.append(node.head)
+                            break
+                        # if node.head.pos_ == 'CCONJ' and node.head.text in negation_cconj:
+                        if node.head.pos_ == 'CCONJ' and node.head._.is_sentence_break:
+                            check.append(node.head)
+                            break
+                        if seen == node.head:
+                            break
+                        else:
+                            node = node.head
+                    attr = set([child for child in check if child._.is_neg])
+                    if attr:
+                        token._.set("is_elite_neg", True)
+                        for child in attr:
+                            child._.set("is_elite_neg", True)
+                            child._.set("is_attr", True)
+                            child._.set("attr_of", token.idx)
+
+            # if entity.label_ == "ELITE" or entity.label_ == "ELITE_STANDALONE":
+            if entity.label_ == "ELITE_STANDALONE":
+                for token in entity:
+                    token._.set("is_elite", True)
+                    if not token._.is_negated:
+                        token._.set("is_elite_neg", True)
+            doc.ents = list(doc.ents) + [entity]
+        # nach content analyse?
+        # for span in filtered:
+        # span.merge()
+        return doc
+
+    def load_dicts(self):
+        dict_folder = "dict"
         # import all dicts
         # elite
         df_elite = pd.read_csv(f"{dict_folder}/elite_dict.csv")
-        self.elite = set(df_elite[df_elite.type != "elite_noneg"]["feature"].tolist())
-        self.elite_noneg = set(
+        self.dict_elite = set(
+            df_elite[df_elite.type != "elite_noneg"]["feature"].tolist()
+        )
+        self.dict_elite_standalone = set(
             df_elite[df_elite.type == "elite_noneg"]["feature"].tolist()
         )
 
         # people
         df_people = pd.read_csv(f"{dict_folder}/people_dict.csv")
-        self.people = set(df_people[df_people.type == "people"]["feature"].tolist())
-        self.people_ordinary = set(
+        self.dict_people = set(
+            df_people[df_people.type == "people"]["feature"].tolist()
+        )
+        self.dict_people_ord = set(
             df_people[df_people.type == "people_ordinary"]["feature"].tolist()
         )
-        self.attr_ordinary = set(
+        self.dict_attr_ord = set(
             df_people[df_people.type == "attr_ordinary"]["feature"].tolist()
         )
-        self.people_ger = set(
+        self.dict_people_ger = set(
             df_people[df_people.type == "people_ger"]["feature"].tolist()
         )
-        self.attr_ger = set(df_people[df_people.type == "attr_ger"]["feature"].tolist())
-
-        # list of sentiment:
-        sent = pd.read_csv(f"{dict_folder}/SentDict.csv")
-        self.positiv = set(
-            [
-                x.strip()
-                for x in sent.loc[sent.sentiment == 1, ["feature"]]["feature"].tolist()
-            ]
-        )
-        self.negativ = set(
-            [
-                x.strip()
-                for x in sent.loc[sent.sentiment == -1, ["feature"]]["feature"].tolist()
-            ]
+        self.dict_attr_ger = set(
+            df_people[df_people.type == "attr_ger"]["feature"].tolist()
         )
 
-        # custom lemmatizer
-        self.lemmatizer = GermaLemma()
+        # testing:
+        # self.dict_people.add("wir sind das volk")
+        # self.dict_elite.add("europäische union")
 
-    def analyze(self, label, text, window_size):
-        def lemma_getter(token):
-            try:
-                return self.lemmatizer.find_lemma(token.text, token.tag_)
-            except:
-                return token.lemma_
 
-        def is_neg_getter(token):
-            if token._.lemma in self.negativ:
-                check = list(token.children)
-                node = token
-                while node.head:
-                    seen = node
-                    if seen == node.head:
-                        break
-                    else:
-                        check.append(node)
-                        check.extend(list(node.children))
-                        node = seen.head
+    # getters
+    def has_volk(self, tokens):
+        return any([t._.get("is_volk") for t in tokens])
 
-                attr = [child for child in check if child.dep_ == "ng"]
-                if attr:
-                    return False
-                else:
-                    return True
-                return True
+    def has_elite(self, tokens):
+        return any([t._.get("is_elite") for t in tokens])
 
-            elif token._.lemma in self.positiv:
-                check = list(token.children)
-                node = token
-                while node.head:
-                    seen = node
-                    if seen == node.head:
-                        break
-                    else:
-                        check.append(node)
-                        check.extend(list(node.children))
-                        node = seen.head
-                attr = [child for child in check if child.dep_ == "ng"]
-                if attr:
-                    return True
-                else:
-                    return False
 
-        def is_pos_getter(token):
-            if token._.lemma in self.positiv:
-                return True
+class ContentAnalysis(object):
+    "Runs Content Analysis as spacy-pipeline-component"
+    name = "content_analysis"
 
-            elif token._.lemma in self.negativ:
-                check = list(token.children)
-                node = token
-                while node.head:
-                    seen = node
-                    if seen == node.head:
-                        break
-                    else:
-                        check.append(node)
-                        check.exten(list(node.children))
-                        node = seen.head
-                attr = [child for child in check if child.dep_ == "ng"]
-                if attr:
-                    return True
-                else:
-                    return False
+    def __init__(self, nlp, window_size=25):
+        self.nlp = nlp
+        self.dictionary = pickle.load(open("plenar_dict.pkl", "rb"))
+        # self.dictionary = None
+        # Results()
+        # self.res = []
+        self.results = Results()
+        self.window_size = window_size
 
-        def is_neg_elite(token):
+        Span.set_extension(
+            "has_elite_neg", getter=self.has_elite_neg_getter, force=True
+        )
+        Span.set_extension(
+            "has_volk", getter=self.has_volk_getter, force=True
+        )
 
-            if token._.is_elite_noneg:
-                info_token = (token._.lemma, None)
-                token._.info = info_token
-                return True
-
-            elif token._.is_elite:
-                check = list(token.children)
-                # if token.head:
-                #     check.append(token.head)
-                node = token
-                while node.head:
-                    #     seen = node
-                    #     if seen == node.head:
-                    #         break
-                    #     else:
-                    #         check.append(node)
-                    #         node = seen.head
-
-                    seen = node
-                    for t in node.ancestors:
-                        if t.dep_ == "conj":
-                            break
-                        for tok in t.children:
-                            if tok.dep_ == "pd":
-                                check.append(tok)
-                            elif tok.dep_ == "mo":
-                                check.append(tok)
-                            elif tok.dep_ == "oa":
-                                check.append(tok)
-                            elif tok.dep_ == "oa2":
-                                check.append(tok)
-                            elif tok.dep_ == "og":
-                                check.append(tok)
-                            elif tok.dep_ == "da":
-                                check.append(tok)
-                            elif tok.dep_ == "op":
-                                check.append(tok)
-                            elif tok.dep_ == "cc":
-                                check.append(tok)
-                            # elif tok.dep_ == 'oprd':
-                            #     check.append(tok)
-                            # elif tok.dep_ == 'attr':
-                            #     check.append(tok)
-                    check.append(node)
-                    node = seen.head
-                    if seen == node.head:
-                        break
-
-                attr = set([child._.lemma.lower() for child in check if child._.is_neg])
-                if attr:
-                    info_token = (token._.lemma, attr)
-                    token._.info = info_token
-                    return True
-                else:
-                    return False
-                # return any([True for child in check if child._.lemma.lower() in negativ])
-            else:
-                return False
-
-        def is_volk(token):
-
-            # if token.pos_ == 'NOUN' or token.pos_ == 'PROPN':
-
-            check = list(token.children)
-
-            if token._.lemma.lower() in self.people:
-                info_token = (token._.lemma, None)
-                token._.info = info_token
-                return True
-
-            elif token._.lemma.lower() in self.people_ordinary:
-                attr = set(
-                    [
-                        child._.lemma.lower()
-                        for child in check
-                        if child._.lemma.lower() in self.attr_ordinary
-                    ]
-                )
-                if attr:
-                    info_token = (token._.lemma, attr)
-                    token._.info = info_token
-                    return True
-                else:
-                    return False
-
-            elif token._.lemma.lower() in self.people_ger:
-                attr = set(
-                    [
-                        child._.lemma.lower()
-                        for child in check
-                        if child._.lemma.lower() in self.attr_ger
-                    ]
-                )
-                if attr:
-                    info_token = (token._.lemma, attr)
-                    token._.info = info_token
-                    return True
-                else:
-                    return False
-
-            else:
-                return False
-
-        all_sents = []
-
-        res_dict = {
-            "doc": label,
-            "len": None,
-            "pop": False,
-            "volk": 0,
-            "elite": 0,
-            "sents": None,
+    def __call__(self, doc):
+        res = {
+            "viz": [],
+            "volk": [],
+            "volk_attr": [],
+            "elite": [],
+            "elite_attr": [],
         }
-        # doc = nlp(gendocs(label))
-        doc = self.nlp(text)
-        hits = {"volk": [], "volk_text": [], "elite": [], "elite_text": [], "attr": [], "volk_ps": [], "elite_ps": [], "attr_ps": []}
 
-        for i, sent in enumerate(doc.sents):
-            for j, token in enumerate(sent):
-
-                # is_negation_getter = lambda token: token._.lemma.lower() in self.negation
-                is_elite_getter = lambda token: token._.lemma.lower() in self.elite
-                is_elite_noneg_getter = (
-                    lambda token: token._.lemma.lower() in self.elite_noneg
-                )
-
-                Token.set_extension("info", default=None, force=True)
-                Token.set_extension("attr", default=False, force=True)
-                Token.set_extension("lemma", getter=lemma_getter, force=True)
-                # Token.set_extension('is_negation', getter=is_negation_getter, force=True)
-                Token.set_extension("is_neg", getter=is_neg_getter, force=True)
-                Token.set_extension("is_pos", getter=is_pos_getter, force=True)
-                Token.set_extension("is_elite", getter=is_elite_getter, force=True)
-                Token.set_extension(
-                    "is_elite_noneg", getter=is_elite_noneg_getter, force=True
-                )
-
-                is_volk_getter = lambda token: is_volk(token)
-                is_neg_elite_getter = lambda token: is_neg_elite(token)
-
-                Token.set_extension("is_volk", getter=is_volk_getter, force=True)
-                Token.set_extension(
-                    "is_neg_elite", getter=is_neg_elite_getter, force=True
-                )
-
-                if token._.is_volk:
-                    hits["volk"].append(token._.lemma)
-                    hits["volk_text"].append(token.text)
-
-                if token._.is_neg_elite:
-                    hits["elite"].append(token._.lemma)
-                    hits["elite_text"].append(token.text)
-                    hits["attr"].append(token._.info)
-                    all_sents.append(sent)
-
-                # Token.set_extension('is_pos_volk', getter=is_pos_volk_getter_func, force=True)
-
+        ##########################################
+        window_size = self.window_size
+        # idf_weight = 1.0
+        ##########################################
 
         matcher = Matcher(self.nlp.vocab)
-        pattern = [{"_": {"is_neg_elite": True}}]
+        pattern = [{"_": {"is_elite_neg": True}}]
         matcher.add("text", None, pattern)
         matches = matcher(doc)
-        has_pop = set()
-        has_pop_ = set()
-        # tokens_pop = []
-        info = []
-        for match_id, start, end in matches:
-            span = doc[start - window_size : end + window_size]
+        doclen = len(doc)
 
-            for token in span:
-                if token._.is_volk:
+        # spans = set()
+        spans = []
+        token_ids = set()
+        ps_counter = 1
+        last_start = None
+        for id, start, end in matches:
+            if start - window_size < 0:
+                start = 0
+            else:
+                start = start - window_size
+            if end + window_size > doclen:
+                end = doclen
+            else:
+                end = end + window_size
+            sentence_start = doc[start].sent.start
+            sentence_end = doc[end-1].sent.end
+            # span = doc[start - window_size : end + window_size]
+            span = {'span_start': sentence_start, 'span_end': sentence_end}
+            # print(span)
+            spans.append(span)
 
-                    # info.append(doc[start]._.info)
-                    # info.append(token._.info)
+            """keep
+            span = doc[sentence_start : sentence_end]
+            spans.add(span)
+            """
 
-                    # tokens_pop.append(doc[start]._.lemma)
-                    # tokens_pop_all.append((doc[start]._.lemma, list(doc[start].children), token._.lemma))
-                    # tokens_pop.append(token._.lemma)
-                    sentence_start = span[0].sent.start
-                    sentence_end = span[-1].sent.end
-                    has_pop.add(doc[sentence_start:sentence_end].text)
-                    has_pop_.add(doc[sentence_start:sentence_end])
+        # CAREFUL!!!!!
+        spans = filter_spans_overlap_no_merge(spans)
+        # print(spans)
+        for span in spans:
+            span = doc[span['span_start'] : span['span_end']]
+            # print(span)
+            if span._.has_elite_neg and span._.has_volk:
+                # check sentiment of span mit sentiws
+                span_sentiment = sum([token._.sentiws for token in span if token._.sentiws])
+                # if span_sentiment > 0.0:
+                #     pass
+                    # print(span_sentiment)
+                    # print(span.text)
+                # else:
+                for token in span:
+                    token._.span_sent = span_sentiment
+                    if token._.is_volk:
+                        # res["viz"].append(ContentAnalysis.get_viz(token, doclen, "V", idf_weight, dictionary=self.dictionary))
+                        if token._.is_attr and token.i not in token_ids:
+                            res["volk_attr"].append(token._.lemma)
+                            res['viz'].append(self.on_hit(token, 'VA', doc[span.start], doc[span.end-1]))
+                            token_ids.add((token.i, "VA"))
+                        else:
+                            if token.i not in token_ids:
+                                res["volk"].append(token._.lemma)
+                                res['viz'].append(self.on_hit(token, 'V', doc[span.start], doc[span.end-1]))
+                                token_ids.add((token.i, "V"))
 
-        for i, sent in enumerate(has_pop_):
-            info.append([[], []])
-            for token in sent:
-                if token._.is_volk:
-                    info[i][0].append(token._.info)
-                if token._.is_neg_elite:
-                    info[i][1].append(token._.info)
+                    if token._.is_elite_neg:
+                        # res["viz"].append(ContentAnalysis.get_viz(token, doclen, "E", idf_weight, dictionary=self.dictionary))
+                        if token._.is_attr and token.i not in token_ids:
+                            res["elite_attr"].append(token._.lemma)
+                            res['viz'].append(self.on_hit(token, 'EA', doc[span.start], doc[span.end-1]))
+                            token_ids.add((token.i, "EA"))
+                        else:
+                            if token.i not in token_ids:
+                                res["elite"].append(token._.lemma)
+                                res['viz'].append(self.on_hit(token, 'E', doc[span.start], doc[span.end-1]))
+                                token_ids.add((token.i, "E"))
+
+        # sorts by start AND deletes duplicates!
+        res["viz"] = sorted(
+            [dict(t) for t in {tuple(d.items()) for d in res["viz"]}],
+            key=lambda i: i["start"],
+        )
+        # res["c_elite"] = Counter(res["elite"])
+        # self.res["token_ids"] = token_ids
+        # res['doclen'] = doclen
+        self.results.doclens.append(doclen)
+        self.results.viz.append(res['viz'])
+        # self.res.append(res)
+        return doc
+
+    # getters
+    def has_elite_neg_getter(self, tokens):
+        return any([t._.get("is_elite_neg") for t in tokens])
+
+    def has_volk_getter(self, tokens):
+        return any([t._.get("is_volk") for t in tokens])
+
+    def on_hit(self, token, label, span_start, span_end):
+        start = token.idx
+        # end = token.idx + len(token.text) + 1
+        end = token.idx + len(token.text)
+        span_start_idx = span_start.idx
+        span_end_idx = span_end.idx + len(span_end.text)
+        lemma = token._.lemma
+        score = 0.0
+        # label = f"{label} | {score:.2f}"
+        res = {"start": start, "end": end, "coding": label, "score": score, "lemma": lemma, "pos": token.pos_, "dep" : token.dep_, "index": token.i, "ent": token.ent_type_, "sent": token._.sentiws, "idf": self.get_idf(lemma), 'negated': token._.is_negated, "attr_of": token._.attr_of, 'isE': token._.is_elite, 'isEN': token._.is_elite_neg, 'span_start' : span_start_idx, 'span_end' : span_end_idx, 'span_sent': token._.span_sent, 'text': token.text}
+        return res
+
+    def get_idf(self, term, idf_weight=1.0):
+        df = self.dictionary.dfs[self.dictionary.token2id[term.lower()]]
+        return tfidfmodel.df2idf(df, self.dictionary.num_docs, log_base=2.0, add=1.0) ** idf_weight
+
+    @staticmethod
+    def get_viz(token, doclen, label, idf_weight, dictionary=None):
+        start = token.idx
+        end = token.idx + len(token.text) + 1
+        # token = token._.lemma
+        if dictionary:
+            score = ContentAnalysis.compute_score_per_term(token, doclen, idf_weight, dictionary)
+        else:
+            score = 0.0
+        label = f"{label} | {score:.2f}"
+        return {"start": start, "end": end, "coding": label, "lemma": token._.lemma, 'pos': token._.pos_, 'dep' : token._.dep_}
 
 
-        c_volk = Counter(([token._.is_volk for token in doc]))
-        c_neg_elite = Counter(([token._.is_neg_elite for token in doc]))
+    @staticmethod
+    def viz(text, row):
+        """visualize documents with displacy"""
+        if isinstance(row, pd.DataFrame):
+            display(row)
+            viz = row.viz[0]
+            ex = [
+                {
+                    "text": text,
+                    "ents": viz,
+                    "title": f"{row['doc'][0]} | {row.name_res[0]} ({row['party'][0]}) | {row['date'][0].strftime('%d/%m/%Y')}",
+                    # "title": "test",
+                }
+            ]
 
-        if has_pop:
-            res_dict["pop"] = True
-        res_dict["doc"] = label
-        res_dict["sents"] = set(has_pop)
-        res_dict["num_pop"] = len(has_pop)
-        res_dict["elite"] = c_neg_elite[True]
-        res_dict["volk"] = c_volk[True]
-        res_dict["len"] = len(doc)
-        res_dict["volk_lemma"] = hits["volk"]
-        res_dict["volk_text"] = hits["volk_text"]
-        res_dict["elite_lemma"] = hits["elite"]
-        res_dict["elite_text"] = hits["elite_text"]
-        res_dict["elite_attr"] = hits["attr"]
-        res_dict["volk_counter"] = Counter(hits["volk"])
-        res_dict["elite_counter"] = Counter(hits["elite"])
-        # res_dict['lemma_pop'] = tokens_pop
-        # res_dict['lemma_pop_count'] = tokens_pop_counter
-        # res_dict['pop_all'] = tokens_pop_all
-        res_dict["hits_pop"] = info
-        # res.append(res_dict)
-        return res_dict
+        else:
+            ex = [
+                {
+                    "text": text,
+                    "ents": viz,
+                    "title": "TEXT",
+                }
+            ]
+
+        # find unique labels for coloring options
+        all_ents = {i["label"] for i in viz}
+        options = {"ents": all_ents, "colors": dict()}
+        for ent in all_ents:
+            if ent.startswith("E"):
+                options["colors"][ent] = "coral"
+            if ent.startswith("V"):
+                options["colors"][ent] = "lightgrey"
+            if ent.startswith("P"):
+                options["colors"][ent] = "yellow"
+
+        displacy.render(ex, style="ent", manual=True, jupyter=True, options=options)
+
+
+    @staticmethod
+    def compute_score_per_term(term, doclen, idf_weight, dictionary):
+        score = ContentAnalysis.compute_idf(term, idf_weight, dictionary)
+        ################################
+        res = score / log(doclen+10, 10)
+        ################################
+        return res
+
+
+    @staticmethod
+    def compute_idf(term, idf_weight=1.0, dictionary=None):
+        df = dictionary.dfs[dictionary.token2id[term.lower()]]
+        return tfidfmodel.df2idf(df, dictionary.num_docs, log_base=2.0, add=1.0) ** idf_weight
+
+
+    @staticmethod
+    def compute_score_from_counts(counts, doclen, idf_weight, dictionary):
+        scores = []
+        for term, n in counts.items():
+            score = ContentAnalysis.compute_score_per_term(term, doclen, idf_weight, dictionary)
+            scores.append(score * n)
+        res = sum(scores)
+        return res
+
+
+    @staticmethod
+    def recount_viz(viz, doclen, dictionary, idf_weight):
+        for i in viz:
+            score = compute_idf(i['lemma'], idf_weight, dictionary)
+            label = i['label']
+            i['label'] = label.replace(label.split('| ')[1], f'{score:.2f}')
+        return viz
+
+
+class Results:
+    """Saves relevant reslts of content analysis and contains mehtods for analysis & visualization"""
+    def __init__(self):
+        self.vocab = dict()
+        # id2token = {value : key for (key, value) in a_dictionary.items()}
+        self.labels = []
+        self.viz = []
+        self.doclens = []
+        self.scores = []
+        self.counts = []
+        self.entities = set()
+        self.meta_mdb = None
+        self.meta_plenar = None
+        self.df = None
+        self.spans = None
+
+    def __repr__(self):
+        # return 'Results of Content Analysis'
+        return '<{0}.{1} object at {2}>'.format(
+        self.__module__, type(self).__name__, hex(id(self)))
+
+    def __len__(self):
+        return len(self.viz)
+
+    def set_entities(self):
+        for doc in self.viz:
+            for hit in doc:
+                if hit['ent'] == '':
+                    hit['ent'] = 'ATTR'
+                self.entities.add(hit['ent'])
+
+    def load_meta():
+        # self.meta_mdb = pd.read_csv('data/mdbs_metadata.csv')
+        self.meta_plenar = pd.read_json('data/plenar_meta.json', orient='index')
+
+    def compute_score(self, idf_weight=2.0, sentiment_weight=1.0, doclen_log = 10, doclen_min=100, by_doclen=True, post=False):
+        scores = []
+        labels = ['E', 'EA', 'V', 'VA']
+        counts = []
+        # seen = set()
+        for i, doc in enumerate(self.viz):
+            seen = set()
+            score_dict = {'score': 0.0}
+            count_dict = {}
+            for ent in self.entities:
+                score_dict[ent] = 0.0
+            for label in labels:
+                score_dict[label] = 0.0
+                count_dict[label] = Counter()
+            for hit in doc:
+                if not hit['sent']:
+                    hit['sent'] = 0.0
+                if post:
+                    # print('is POST')
+                    if hit['TOK_IS_POP'] and hit['SPAN_IS_POP'] and hit['start'] not in seen:
+                        # score = (hit['idf'] ** idf_weight) * ((1+fabs(hit['sent'])) ** sentiment_weight) / log(self.doclens[i]+doclen_weight, 10)
+                        score = (hit['idf'] ** idf_weight) * ((1+fabs(hit['sent'])) ** sentiment_weight)
+                        seen.add(hit['start'])
+                    else:
+                        score = 0.0
+                else:
+                    if hit['start'] not in seen:
+                        # score = (hit['idf'] ** idf_weight) * ((1+fabs(hit['sent'])) ** sentiment_weight) / log(self.doclens[i]+doclen_weight, 10)
+                        score = (hit['idf'] ** idf_weight) * ((1+fabs(hit['sent'])) ** sentiment_weight)
+                        seen.add(hit['start'])
+                if by_doclen:
+                    score = score / log(self.doclens[i] + doclen_min, doclen_log)
+                hit['score'] = score
+                score_dict['score'] += score
+                score_dict[hit['ent']] += score
+                score_dict[hit['coding']] += score
+                count_dict[hit['coding']].update([hit['lemma']])
+            # for label in labels:
+            #     count_dict[label] = Counter(count_dict[label])
+            counts.append(count_dict)
+            scores.append(score_dict)
+        self.scores = scores
+        self.counts = counts
+
+
+    def compute_score_spans(self):
+        span_dict = {}
+        # {doc: [(span_start, span_end, score_sum)]}
+        for i, doc in enumerate(self.viz):
+            label = self.labels[i]
+            span_dict[label] = {}
+            # scores = []
+            for hit in doc:
+                span_start = hit['span_start']
+                span_end = hit['span_end']
+                span_id = (span_start, span_end)
+                if span_id not in span_dict[label]:
+                    span_dict[label][span_id] = 0.0
+                span_dict[label][span_id] += hit['score']
+
+            # span_dict[label] = sorted(
+            #     [dict(t) for t in {tuple(d.items()) for d in res["viz"]}],
+            #     key=lambda i: i["start"],
+            # )
+
+        self.spans = span_dict
+
+
+    def top_spans(self, topn=10):
+        all_spans = []
+        for doc in self.spans.items():
+            for span in doc[1]:
+                all_spans.append((doc[0], span, self.spans[doc[0]][span]))
+        all_spans.sort(key = lambda tup: tup[2], reverse=True)
+        return all_spans[:topn]
+
+
+    def create_df(self):
+        # df = pd.DataFrame.from_dict({'doc': self.labels}, {'doclen': self.doclens}, {'scores': self.scores})
+        df = pd.DataFrame.from_dict({'doc': self.labels, 'doclen': self.doclens, 'scores': self.scores})
+        df = pd.concat([df.drop('scores', axis=1), df.scores.apply(pd.Series)], axis=1, sort=False)
+        self.df = df
+
+
+    def prepare(self, post=False):
+        self.set_entities()
+        self.compute_score(by_doclen=True, idf_weight=1.5, doclen_log=10, post=post)
+        self.compute_score_spans()
+        self.create_df()
+        self.add_meta_plenar()
+
+
+    def visualize(self, label, span=None, filter_by=False, pres=False):
+        row = self.df.loc[self.df['doc'] == label]
+        text = gendocs(label)
+        viz = copy.deepcopy(self.viz[self.labels.index(label)])
+        # pprint(viz)
+        Results.render(text, row, viz, span=span, filter_by=filter_by, pres=pres)
+
+
+    @staticmethod
+    def render(text, row, viz, span=None, filter_by=['score'], pres=False):
+        """visualize documents with displacy"""
+
+        def filter_by_condition(viz, condition):
+            viz = [i for i in viz if i[condition]]
+            return viz
+
+        viz = Results.filter_viz(viz, on='start')
+        viz = filter_spans_overlap(viz)
+        viz_span = []
+
+        if span:
+            span = span
+        else:
+            span = (0, len(text) + 1)
+
+        if pres:
+            viz_span_ = []
+            for hit in viz:
+                paragraph = {}
+                hit['start'] -= span[0]
+                hit['end'] -= span[0]
+                paragraph['start'] = hit['span_start']
+                paragraph['end'] = hit['span_end']
+                # hit['label'] = f"{hit['coding']} | {hit['score']:.2f}"
+                if paragraph['start'] not in [i['start'] for i in viz_span_]:
+                    viz_span_.append(paragraph)
+
+            for n, v in enumerate(viz_span_):
+                viz_span.append({'start': v['start'], 'end': v['end'], 'label': f'P|{n+1}'})
+
+            viz_span = sorted(viz_span, key=lambda x: x['start'])
+
+        ##################################################
+        else:
+
+            if filter_by:
+                for condition in filter_by:
+                    viz = filter_by_condition(viz, condition)
+
+            if span[0] > 0:
+                viz = [i for i in viz if i['span_start'] == span[0]]
+
+            for hit in viz:
+
+                hit['start'] -= span[0]
+                hit['end'] -= span[0]
+
+                hit['label'] = f"{hit['coding']} | {hit['score']:.2f}"
+                viz_span.append(hit)
+
+            viz_starts = set([i['span_start'] for i in viz])
+
+            for n, start in enumerate(sorted(viz_starts)):
+                if start > 0 and span[0] == 0:
+                    viz_span.append({'start': start-1, 'end': start, 'label': f'P{n+1} | {start}'})
+
+            viz_span = sorted(viz_span, key=lambda x: x['start'])
+        ###############################################
+
+        ex = [
+            {
+                "text": text[span[0]: span[1]],
+                "ents": viz_span,
+                "title": f"{row['doc'][0]} | {row.name_res[0]} ({row['party'][0]}) | {row['date'][0].strftime('%d/%m/%Y')}",
+                # "title": f"{row['doc']} | {row.name_res} ({row['party']}) | {row['date'].strftime('%d/%m/%Y')}",
+                # 'title': 'text'
+            }
+        ]
+        all_ents = {i["label"] for i in viz_span}
+
+        # else:
+        #     viz_all = []
+        #     for hit in viz:
+        #         hit['label'] = f"{hit['coding']} | {hit['score']:.2f}"
+        #         viz_all.append(hit)
+        #     ex = [
+        #         {
+        #             "text": text,
+        #             "ents": viz_all,
+        #             "title": f"{row['doc'][0]} | {row.name_res[0]} ({row['party'][0]}) | {row['date'][0].strftime('%d/%m/%Y')}",
+        #         }
+        #     ]
+        #     # find unique labels for coloring options
+        #     all_ents = {i["label"] for i in viz_all}
+
+        options = {"ents": all_ents, "colors": dict()}
+        for ent in all_ents:
+            if ent.startswith("E"):
+                options["colors"][ent] = "coral"
+            if ent.startswith("V"):
+                options["colors"][ent] = "lightgrey"
+            if ent.startswith("P"):
+                options["colors"][ent] = "yellow"
+
+        displacy.render(ex, style="ent", manual=True, jupyter=True, options=options)
+
+    def add_meta_plenar(self):
+        df = pd.read_json("data/plenar_meta.json", orient="index")
+        # keep for future
+        # dfval_2 = pd.read_json('/media/philippy/SSD/data/ma/corpus/presse_meta.json', orient='index')
+        # dfval_3 = pd.read_json('/media/philippy/SSD/data/ma/corpus/twitter_meta.json', orient='index')
+        # dfval = dfval_1.append([dfval_2, dfval_3])
+        df["doc"] = df.index
+        df["doc"] = df.doc.apply(lambda x: x.split(".")[0])
+        # fix timestamps
+        df["date"] = df.datum
+        df["date"] = pd.to_datetime(df["date"], unit="ms", errors="ignore")
+        # merge results and meta
+        dfs = self.df.merge(df.loc[:, ["date", "party", "doc", "name_res", "gender", "election_list", "education", "birth_year"]], how="left", on="doc")
+        dfs = dfs.set_index("date").loc["2013-10-01":"2020-01-01"]
+        dfs["date"] = dfs.index
+        self.df = dfs
+
+    def evaluate_by_category(self, category, target):
+        grouped = self.df.groupby(category).mean().sort_values(target, ascending=False)
+        # mdbs_meta = pd.read_csv('data/mdbs_metadata.csv')
+        # res = pd.merge(grouped, mdbs_meta, how='left', on=category)
+        return grouped
+
+    def top_terms(self, cat=False, abs=True, party=None, topn=100):
+        if party:
+            df = self.df.loc[self.df.party == party].copy()
+        else:
+            df = self.df.copy()
+        if abs:
+            labels = [i for i in df.doc]
+            ids = []
+            for label in labels:
+                ids.append(self.labels.index(label))
+            res = []
+            for i, count in enumerate(self.counts):
+                if i in ids:
+                    if cat:
+                        res.append(count[cat])
+                    else:
+                        res.extend(count.values())
+            # res = df.apply(lambda row: Counter(row.counts[cat]), axis=1)
+            res = sum([i for i in res], Counter())
+        else:
+            labels = [i for i in df.doc]
+            ids = []
+            for label in labels:
+                ids.append(self.labels.index(label))
+
+            score_dict = {}
+
+            for i, doc in enumerate(self.viz):
+                if i in ids:
+                    for hit in doc:
+                        if cat:
+                            if hit['coding'] == cat:
+                                if hit['lemma'] not in score_dict:
+                                    score_dict[hit['lemma']] = 0.0
+                                score_dict[hit['lemma']] += hit['score']
+                        else:
+                            if hit['lemma'] not in score_dict:
+                                score_dict[hit['lemma']] = 0.0
+                            score_dict[hit['lemma']] += hit['score']
+            res = score_dict
+
+        return dict(sorted(res.items(), key=lambda x: x[1], reverse=True)[:topn])
+
+
+    def coded(self, label, index_start, categories=None):
+        for hit in self.viz[self.labels.index(label)]:
+            # if hit['lemma'] == 'steuerzahler':
+            if hit['span_start'] == index_start:
+                if not categories:
+                    hits.apend(hit)
+                else:
+                    return({cat: hit[cat] for cat in categories})
+        return(hits)
+
+
+    def coding(self):
+        res_viz = []
+        for i, (doc, doc_vizs) in enumerate(zip(self.spans, self.viz)):
+            # if i % 500 == 0:
+            #     print(i, f'/{len(self.spans)}')
+            doc_viz = []
+            # doc_vizs = Results.filter_viz(doc_vizs, on='start')
+            for span in self.spans[doc]:
+                viz = []
+                text = gendocs(doc)[span[0]:span[1]]
+                viz.extend([viz for viz in doc_vizs if viz['span_start'] == span[0] and viz['span_end'] == span[1]])
+
+                # final coding
+                pop_hits_v = 0
+                pop_hits_e = 0
+                for v in viz:
+                    v['TOK_IS_POP'] = False
+                    v['SPAN_IS_POP'] = False
+
+                    if v['RLY_GER'] and (v['RLY_V'] == True or v['RLY_E'] == True):
+                        v['TOK_IS_POP'] = True
+                    if v['TOK_IS_POP'] and v['coding'] == 'V':
+                        pop_hits_v += 1
+                        for attr in viz:
+                            if attr['attr_of'] == v['start']:
+                                attr['RLY_V'] = True
+                                attr['TOK_IS_POP'] = True
+                    if v['TOK_IS_POP'] and (v['coding'] == 'E' or (v['coding'] == 'EA' and v['pos'] == 'NOUN')):
+                        pop_hits_e += 1
+                        for attr in viz:
+                            if attr['attr_of'] == v['start']:
+                                attr['RLY_E'] = True
+                                attr['TOK_IS_POP'] = True
+
+                if pop_hits_v > 0 and pop_hits_e > 0:
+                    for v in viz:
+                        v['SPAN_IS_POP'] = True
+                doc_viz.extend(viz)
+            res_viz.append(doc_viz)
+        self.viz = res_viz
+
+
+    def coding_pop(self, idf_weight=1.5, sentiment_weight=1.0):
+        self.set_entities()
+        self.coding()
+        self.compute_score(by_doclen=True, idf_weight=idf_weight, sentiment_weight=sentiment_weight, doclen_log=2, post=True)
+        self.create_df()
+        self.add_meta_plenar()
+
+
+    def filter_res(self, label):
+        res = Results()
+        id = self.labels.index(label)
+        res.viz = [self.viz[id]]
+        res.labels = [self.labels[id]]
+        res.doclens = [self.doclens[id]]
+        res.scores = [self.scores[id]]
+        res.spans = {label: self.spans[label]}
+        return res
+
+
+    @staticmethod
+    def filter_viz(viz, on='start'):
+        res = []
+        ids = set()
+        for hit in viz:
+            if hit[on] not in ids:
+                res.append(hit)
+                ids.add(hit[on])
+
+        return res
+
+    @staticmethod
+    def visualize_text(text, row):
+        """visualize documents with displacy"""
+        if isinstance(row, pd.DataFrame):
+            display(row)
+            viz = row.viz[0]
+            ex = [
+                {
+                    "text": text,
+                    "ents": viz,
+                    "title": f"{row['doc'][0]} | {row.name_res[0]} ({row['party'][0]}) | {row['date'][0].strftime('%d/%m/%Y')}",
+                    # "title": "test",
+                }
+            ]
+
+        else:
+            viz = row
+            for hit in viz:
+                hit['label'] = f"{hit['label']} | {hit['score']:.2f}"
+            ex = [
+                {
+                    "text": text,
+                    "ents": viz,
+                    "title": "TEXT",
+                }
+            ]
+
+        # find unique labels for coloring options
+        all_ents = {i["label"] for i in viz}
+        options = {"ents": all_ents, "colors": dict()}
+        for ent in all_ents:
+            if ent.startswith("E"):
+                options["colors"][ent] = "coral"
+            if ent.startswith("V"):
+                options["colors"][ent] = "lightgrey"
+            if ent.startswith("P"):
+                options["colors"][ent] = "yellow"
+
+        displacy.render(ex, style="ent", manual=True, jupyter=True, options=options)
 
 
 class MyCorpus(object):
@@ -427,157 +1036,6 @@ class EndOfTraining(Exception):
     pass
 
 
-def populism_score_main(df, dictionary, idf_weight):
-    df['counters_pop_hits'] = df.apply(lambda row: count_pop_hits(row), axis=1)
-    df['scores'] = df.apply(lambda row: compute_score_per_category(row, dictionary, idf_weight), axis=1)
-    # seperate into columns:
-    df['score'] = df.apply(lambda row: sum(row.scores[:3]), axis=1)
-    df['score_pop'] = df.apply(lambda row: sum(row.scores[3:]), axis=1)
-    df['score_volk'] = df.apply(lambda row: row.scores[0], axis=1)
-    df['score_elite'] = df.apply(lambda row: row.scores[1], axis=1)
-    df['score_attr'] = df.apply(lambda row: row.scores[2], axis=1)
-    df['score_volk_pop'] = df.apply(lambda row: row.scores[3], axis=1)
-    df['score_elite_pop'] = df.apply(lambda row: row.scores[4], axis=1)
-    df['score_attr_pop'] = df.apply(lambda row: row.scores[5], axis=1)
-    return df
-
-
-def count_pop_hits(row):
-    """
-    counts volk, elite and attributes in the codings from the sentence column (pop_hits)
-    """
-    all_hits = row.hits_pop
-    label = row.doc
-    hits_volk = []
-    hits_elite = []
-    hits_attr = []
-    for hit in all_hits:
-        v = []
-        e = []
-        a = []
-        for volk in hit[0]:
-            v.append(volk[0])
-            a.append(volk[1])
-        for elite in hit[1]:
-            e.append(elite[0])
-            a.append(elite[1])
-        hits_volk.append(v)
-        hits_elite.append(e)
-        hits_attr.append(a)
-    count_volk = Counter([ i for i in flatten(hits_volk) if i is not None])
-    count_elite = Counter([i for i in flatten(hits_elite) if i is not None])
-    count_attr = Counter([i for i in flatten(hits_attr) if i is not None])
-    return count_volk, count_elite, count_attr
-
-
-def compute_score_from_counts(counts, doclen, dictionary, idf_weight):
-    # number docs should be constant!
-    scores = []
-    for term, n in counts.items():
-        score = compute_idf(term, dictionary)
-        scores.append((score**idf_weight) * n)
-    res = sum(scores) / log(doclen+10, 10)
-    # res = sum(scores)
-    return res
-
-
-def compute_score_per_term(term, doclen, dictionary, idf_weight):
-    score = compute_idf(term, dictionary) ** idf_weight
-    res = score / log(doclen+10, 10)
-    return res
-
-
-def compute_score_per_category(row, dictionary, idf_weight):
-    if row['pop'] == True:
-        volk = compute_score_from_counts(row.volk_counter, row.len, dictionary, idf_weight)
-        elite = compute_score_from_counts(row.elite_counter, row.len, dictionary, idf_weight)
-        attr = compute_score_from_counts(row.attr_counter, row.len, dictionary, idf_weight)
-        volk_pop = compute_score_from_counts(row.counters_pop_hits[0], row.len, dictionary, idf_weight)
-        elite_pop = compute_score_from_counts(row.counters_pop_hits[1], row.len, dictionary, idf_weight)
-        attr_pop = compute_score_from_counts(row.counters_pop_hits[2], row.len, dictionary, idf_weight)
-    else:
-        volk = 0.0
-        elite = 0.0
-        attr = 0.0
-        volk_pop = 0.0
-        elite_pop = 0.0
-        attr_pop = 0.0
-    return (volk, elite, attr, volk_pop, elite_pop, attr_pop)
-
-
-def compute_idf(term, dictionary, idf_weight=None):
-    df = dictionary.dfs[dictionary.token2id[term.lower()]]
-    if idf_weight:
-        return tfidfmodel.df2idf(df, dictionary.num_docs, log_base=2.0, add=1.0)**idf_weight
-    else:
-        score = tfidfmodel.df2idf(df, dictionary.num_docs, log_base=2.0, add=1.0)
-        return score
-
-
-def load_results_content_analysis(folder):
-    """load dataframe from results folder"""
-    all_files = glob.glob(f"{folder}/*.csv")
-    li = []
-    for filename in all_files:
-        df = pd.read_csv(filename, index_col=None, header=0)
-        df.drop(columns = 'Unnamed: 0', inplace=True)
-        li.append(df)
-    dfog = pd.concat(li, axis=0, ignore_index=True)
-    # dfog = pd.read_csv(filename)
-    dfval = pd.read_json("data/plenar_meta.json", orient="index")
-    # keep for future
-    # dfval_2 = pd.read_json('/media/philippy/SSD/data/ma/corpus/presse_meta.json', orient='index')
-    # dfval_3 = pd.read_json('/media/philippy/SSD/data/ma/corpus/twitter_meta.json', orient='index')
-    # dfval = dfval_1.append([dfval_2, dfval_3])
-    dfval["doc"] = dfval.index
-    dfval["doc"] = dfval.doc.apply(lambda x: x.split(".")[0])
-    # fix timestamps
-    df = dfval.copy()
-    df["date"] = df.datum
-    df["date"] = pd.to_datetime(df["date"], unit="ms", errors="ignore")
-    dfval = df
-    # merge results and meta
-    dfs = dfog.merge(dfval.loc[:, ["date", "party", "doc", "name_res", "gender", "election_list", "education", "birth_year"]], how="left", on="doc")
-    dfs = dfs.set_index("date").loc["2013-10-01":"2020-01-01"]
-    dfs["date"] = dfs.index
-    # eval strings
-    # dfs["elite_attr"] = dfs.apply(lambda row: eval(str(row.elite_attr)), axis=1)
-    # dfs["volk_counter"] = dfs.apply(lambda row: eval(str(row.volk_counter)), axis=1)
-    # dfs["elite_counter"] = dfs.apply(lambda row: eval(str(row.elite_counter)), axis=1)
-    # dfs['attr_counter'] = dfs.apply(lambda row: Counter([term for i in row.elite_attr for term in (i[1] if i[1] is not None else [])]), axis=1)
-    # dfs["hits_pop"] = dfs.apply(lambda row: eval(str(row.hits_pop)), axis=1)
-    # # add type and opposition
-    # dfs["typ"] = dfs["doc"].apply(lambda row: row.split("_")[0])
-    # dfs["opp"] = dfs.apply(lambda row: isopp(row), axis=1)
-    return dfs
-
-
-
-
-def isopp(row):
-    if row.party in ["CDU", "SPD", "CSU"]:
-        return "not_opp"
-    else:
-        return "opp"
-
-
-def merge_meta(df):
-    dfval = pd.read_json("data/plenar_meta.json", orient="index")
-    # dfval_2 = pd.read_json('/media/philippy/SSD/data/ma/corpus/presse_meta.json', orient='index')
-    # dfval_3 = pd.read_json('/media/philippy/SSD/data/ma/corpus/twitter_meta.json', orient='index')
-    # dfval = dfval_1.append([dfval_2, dfval_3])
-
-    dfval["doc"] = dfval.index
-    dfval["doc"] = dfval.doc.apply(lambda x: x.split(".")[0])
-
-    dfval["date"] = dfval.datum
-    dfval["date"] = pd.to_datetime(dfval["date"], unit="ms", errors="ignore")
-
-    dfs = df.merge(dfval, how="left", on="doc")
-
-    return dfs
-
-
 def load_data(party):
     with open("data/doc_labels_plenar.pkl", "rb") as f:
         doc_labels_plenar = pickle.load(f)
@@ -601,32 +1059,114 @@ def gendocs(label):
         return text_file.read()
 
 
-def lemma_getter(token):
-    try:
-        return lemmatizer.find_lemma(token.text, token.tag_)
-    except:
-        return token.lemma_
+def custom_extensions(doc):
 
-
-def sentences_gen(labels):
     lemmatizer = GermaLemma()
+    negation_words = set(["nie", "keinsterweise", "keinerweise", "niemals", "nichts", "kaum", "keinesfalls", "ebensowenig", "nicht", "kein", "keine", "weder"])
+    negation_cconj = set(['aber', 'jedoch', 'doch', 'sondern'])
+
+    def lemma_getter(token):
+        # if " " in token.text:
+        #     return token.lemma_.lower()
+        try:
+            return lemmatizer.find_lemma(token.text, token.tag_).lower()
+        except:
+            return token.lemma_.lower()
+
+    def is_negation_getter(token):
+        if token._.lemma in negation_words:
+            return True
+        else:
+            return False
+
+    def is_sentence_break_getter(token):
+        if token._.lemma in negation_cconj:
+            return True
+        else:
+            return False
+
+    Token.set_extension("lemma", getter=lemma_getter, force=True)
+    Token.set_extension("is_negation", getter=is_negation_getter, force=True)
+    Token.set_extension("is_sentence_break", getter=is_sentence_break_getter, force=True)
+    return doc
+
+
+def recount_viz(df, dictionary, idf_weight):
+    df['viz'] = df.apply(lambda row: ContentAnalysis.recount_viz(row['viz'], row['doclen'], dictionary, idf_weight), axis=1)
+
+
+def compute_score_from_df(df, dictionary, idf_weight=1.0):
+    cols = ['viz', 'volk', 'volk_attr', 'elite', 'elite_attr']
+    for col in cols:
+        df[col] = df.apply(lambda row: eval(str(row[col])), axis=1)
+    for col in cols[1:]:
+        df[f'c_{col}'] = df.apply(lambda row: Counter(row[col]), axis=1)
+        df[f'score_{col}'] = df.apply(lambda row: ContentAnalysis.compute_score_from_counts(row[f'c_{col}'], row['doclen'], idf_weight, dictionary), axis=1)
+    df['score'] = df.apply(lambda row: sum([row[f'score_{col}'] for col in cols[1:]]), axis=1)
+
+
+# def evaluate_by_category(category, target, df):
+#     grouped = df.groupby(category).mean().sort_values(target, ascending=False)
+#     mdbs_meta = pd.read_csv('data/mdbs_metadata.csv')
+#     res = pd.merge(grouped, mdbs_meta, how='left', on=category)
+#     display(res)
+
+
+def serialize(directory, party='all', sample=None):
+
+    Path(f"nlp/{directory}/docs").mkdir(parents=True, exist_ok=False)
+
+    doc_labels = load_data(party)
+    if type(sample) == int:
+        doc_labels = random.sample(doc_labels, sample)
+        text = None
+    elif type(sample) == str:
+        doc_labels = ['test']
+        text = sample
+    elif type(sample) == list:
+        doc_labels = sample
+        text = None
+    else:
+        text = None
+    print("Number of documents: {}".format(len(doc_labels)))
+    print(f"Beginning Serialization with parameters: \n Party: {party}")
     nlp = spacy.load("de_core_news_lg")
-    for label in labels:
-        doc = nlp(gendocs(label))
-        for i, sent in enumerate(doc.sents):
-            res = []
-            for j, token in enumerate(sent):
-                Token.set_extension("lemma", getter=lemma_getter, force=True)
-                if not token.is_punct and not token.is_digit and not token.is_space:
-                    tok = token._.lemma.lower()
-                    tok = tok.replace(".", "")
-                    res.append(tok)
-            res = [word for word in res if not word in STOP_WORDS]
-            yield res
+    ca = ContentAnalysis(nlp)
+    entity_recognizer = EntityRecognizer(nlp)
+    sentiment_recognizer = SentimentRecognizer(nlp)
+    # nlp.add_pipe(ca, last=True)
+    nlp.add_pipe(custom_lemma, last=True)
+    nlp.add_pipe(sentiment_recognizer, last=True)
+    nlp.add_pipe(entity_recognizer, last=True)
+    nlp.remove_pipe("ner")
+    labels = []
+    # doc_bin = DocBin(attrs=["LEMMA", "POS", "DEP", "ENT_TYPE"], store_user_data=True)
+    for label in tqdm(doc_labels):
+        labels.append(label)
+        if text:
+            doc = nlp(text)
+
+        else:
+            doc = nlp(gendocs(label))
+        # json_doc = doc.to_json(['has_volk', 'has_elite'])
+        # doc_bin.add(doc)
+        # with open(f'nlp/test/{label}.json', 'w') as outfile:
+        #     json.dump(json_doc, outfile)
+        doc_bytes = doc.to_bytes()
+        with open(f'nlp/{directory}/docs/{label}', 'wb') as f:
+            f.write(doc_bytes)
+    # nlp.to_disk('nlp/test')
+    # data = doc_bin.to_bytes()
+    # with open(f'nlp/{directory}/docs_plenar', 'wb') as f:
+    #     f.write(data)
+    nlp.vocab.to_disk(f'nlp/{directory}/vocab.txt')
+    with open(f'nlp/{directory}/labels.pkl', 'wb') as f:
+        pickle.dump(labels, f)
+    print(f"Serialization complete. \nResults saved in nlp/{directory}/")
 
 
 def hash(w):
-    return int(hashlib.md5(w.encode("utf-8")).hexdigest()[:9], 16)
+    return int(hashlib.md5(w.encode('utf-8')).hexdigest()[:9], 16)
 
 
 def intersect(pre, new):
@@ -660,82 +1200,32 @@ def merge_embeddings(models):
 def load_models(party, iter):
     all_models = []
     for i in range(iter):
-        all_models.append(Word2Vec.load(f"res_da/w2v_models/emb_{party}_{i}.model"))
+        all_models.append(Word2Vec.load(f'res_da/w2v_models/emb_{party}_{i}.model'))
     return all_models
 
 
-def format_output(all_hits):
-    res = []
-    attr = []
-    for hit in all_hits:
-        print(hit)
-        v = []
-        e = []
-        a = []
-        for volk in hit[0]:
-            v.append(volk[0])
-            a.append(volk[1])
-        for elite in hit[1]:
-            e.append(elite[0])
-            e.append("|")
-            a.append(elite[1])
-
-        res.append((tuple(v), tuple(e)))
-        attr.append(tuple(a))
-    return res
+def sentences_gen(labels):
+    for label in labels:
+        doc = nlp(gendocs(label))
+        for i, sent in enumerate(doc.sents):
+            res = []
+            for j, token in enumerate(sent):
+                Token.set_extension('lemma', getter=lemma_getter, force=True)
+                if not token.is_punct and not token.is_digit and not token.is_space:
+                    tok = token._.lemma.lower()
+                    tok = tok.replace('.', '')
+                    res.append(tok)
+            res = [word for word in res if not word in STOP_WORDS]
+            yield res
 
 
-def count_attr(all_hits):
-    attr = []
-    for hit in all_hits:
-        a = []
-        for volk in hit[0]:
-            a.append(volk[1])
-        for elite in hit[1]:
-            a.append(elite[1])
-
-        attr.append(a)
-    res = list(flatten(attr))
-    counter_attr.update(res)
-    return res
+def lemma_getter(token):
+    # if " " in token.text:
+    #     return token.lemma_.lower()
+    try:
+        return lemmatizer.find_lemma(token.text, token.tag_).lower()
+    except:
+        return token.lemma_.lower()
 
 
-def load_meta():
-    df = pd.read_json("data/plenar_meta.json", orient="index")
-    df["date"] = df.datum
-    df["date"] = pd.to_datetime(df["date"], unit="ms", errors="ignore")
-    return df
 
-
-def print_doc(label):
-    meta = load_meta()
-    print(meta.loc[f'{label}.txt'])
-    print(gendocs(label))
-
-
-# def compute_score_sum(d):
-    # return d["volk"] + d["elite"]
-
-
-# def load_meta():
-#     df = pd.read_json("data/plenar_meta.json", orient="index")
-#     return df
-
-if __name__ == "__main__":
-    # %%
-    text = "Die Deutschen finden Merkel ist nicht schlau"
-    res = []
-    res.append(analysis(text))
-
-    # %%
-    import spacy
-    from spacy import displacy
-
-    doc = nlp(text)
-    displacy.render(doc, style="dep")
-
-    # %%
-    df = pd.DataFrame(res)
-    df
-    # df[df['pop'] == True]
-    # %%
